@@ -15,12 +15,13 @@ from data_utils import get_lm_corpus
 from mem_transformer import MemTransformerLM
 from utils.exp_utils import create_exp_dir
 from utils.data_parallel import BalancedDataParallel
+import apex.amp as amp
 
 parser = argparse.ArgumentParser(description='PyTorch Transformer Language Model')
 parser.add_argument('--data', type=str, default='../data/wikitext-103',
                     help='location of the data corpus')
 parser.add_argument('--dataset', type=str, default='wt103',
-                    choices=['wt103', 'lm1b', 'enwik8', 'text8'],
+                    choices=['wt103', 'lm1b', 'enwik8', 'text8', 'bilingual_ted'],
                     help='dataset name')
 parser.add_argument('--n_layer', type=int, default=12,
                     help='number of total layers')
@@ -135,6 +136,8 @@ parser.add_argument('--finetune_v3', action='store_true',
                     help='finetune v3')
 parser.add_argument('--fp16', action='store_true',
                     help='Run in pseudo-fp16 mode (fp16 storage fp32 math).')
+parser.add_argument('--opt_level', type=str, default='O0',
+                    help='optimization level for apex')
 parser.add_argument('--static-loss-scale', type=float, default=1,
                     help='Static loss scale, positive power of 2 values can '
                     'improve fp16 convergence.')
@@ -285,8 +288,8 @@ else:
 args.n_all_param = sum([p.nelement() for p in model.parameters()])
 args.n_nonemb_param = sum([p.nelement() for p in model.layers.parameters()])
 
-if args.fp16:
-    model = model.half()
+# if args.fp16:
+#     model = model.half()
 
 if args.multi_gpu:
     model = model.to(device)
@@ -327,6 +330,10 @@ elif args.optim.lower() == 'adam':
 elif args.optim.lower() == 'adagrad':
     optimizer = optim.Adagrad(model.parameters(), lr=args.lr)
 
+#### Apex
+model, optimizer = amp.initialize(model, optimizer, opt_level=args.opt_level)
+
+
 #### scheduler
 if args.scheduler == 'cosine':
     # here we do not set eta_min to lr_min to be backward compatible
@@ -356,13 +363,13 @@ elif args.scheduler == 'dev_perf':
 elif args.scheduler == 'constant':
     pass
 
-if args.cuda and args.fp16:
-    # If args.dynamic_loss_scale is False, static_loss_scale will be used.
-    # If args.dynamic_loss_scale is True, it will take precedence over static_loss_scale.
-    optimizer = FP16_Optimizer(optimizer,
-                               static_loss_scale = args.static_loss_scale,
-                               dynamic_loss_scale = args.dynamic_loss_scale,
-                               dynamic_loss_args = {'init_scale': 2 ** 16})
+# if args.cuda and args.fp16:
+#     # If args.dynamic_loss_scale is False, static_loss_scale will be used.
+#     # If args.dynamic_loss_scale is True, it will take precedence over static_loss_scale.
+#     optimizer = FP16_Optimizer(optimizer,
+#                                static_loss_scale = args.static_loss_scale,
+#                                dynamic_loss_scale = args.dynamic_loss_scale,
+#                                dynamic_loss_args = {'init_scale': 2 ** 16})
 
 if args.restart:
     if os.path.exists(os.path.join(args.restart_dir, 'optimizer.pt')):
@@ -371,6 +378,8 @@ if args.restart:
             optimizer.load_state_dict(opt_state_dict)
     else:
         print('Optimizer was not saved. Start from scratch.')
+
+
 
 logging('=' * 100)
 for k, v in args.__dict__.items():
@@ -436,25 +445,29 @@ def train():
                 ret = para_model(data_i, target_i, *mems[i])
                 loss, mems[i] = ret[0], ret[1:]
                 loss = loss.float().mean().type_as(loss) / args.batch_chunk
-                if args.fp16:
-                    optimizer.backward(loss)
-                else:
-                    loss.backward()
+                # if args.fp16:
+                #     optimizer.backward(loss)
+                # else:
+                # loss.backward()
+                with amp.scale_loss(loss, optimizer) as scaled_loss:
+                    scaled_loss.backward()
                 train_loss += loss.float().item()
         else:
             ret = para_model(data, target, *mems)
             loss, mems = ret[0], ret[1:]
             loss = loss.float().mean().type_as(loss)
-            if args.fp16:
-                optimizer.backward(loss)
-            else:
-                loss.backward()
+            # if args.fp16:
+            #     optimizer.backward(loss)
+            # else:
+            # loss.backward()
+            with amp.scale_loss(loss, optimizer) as scaled_loss:
+                scaled_loss.backward()
             train_loss += loss.float().item()
 
-        if args.fp16:
-            optimizer.clip_master_grads(args.clip)
-        else:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
+        # if args.fp16:
+        #     optimizer.clip_master_grads(args.clip)
+        # else:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
 
         optimizer.step()
         if args.sample_softmax > 0:
@@ -509,7 +522,7 @@ def train():
             if not best_val_loss or val_loss < best_val_loss:
                 if not args.debug:
                     with open(os.path.join(args.work_dir, 'model.pt'), 'wb') as f:
-                        torch.save(model, f)
+                        torch.save(model.state_dict(), f)
                     with open(os.path.join(args.work_dir, 'optimizer.pt'), 'wb') as f:
                         torch.save(optimizer.state_dict(), f)
                 best_val_loss = val_loss

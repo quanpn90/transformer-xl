@@ -92,6 +92,7 @@ class Vocab(object):
     def encode_file(self, path, ordered=False, verbose=False, add_eos=True,
             add_double_eos=False):
         if verbose: print('encoding file {} ...'.format(path))
+        print(path)
         assert os.path.exists(path)
         encoded = []
         with open(path, 'r', encoding='utf-8') as f:
