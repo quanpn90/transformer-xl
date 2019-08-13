@@ -561,7 +561,7 @@ except KeyboardInterrupt:
 # Load the best saved model.
 with open(os.path.join(args.work_dir, 'model.pt'), 'rb') as f:
     model = torch.load(f)
-para_model = model.to(device)
+    para_model = model.to(device)
 
 # Run on test data.
 test_loss = evaluate(te_iter)

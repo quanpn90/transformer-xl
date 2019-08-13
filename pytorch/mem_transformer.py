@@ -140,6 +140,7 @@ class MultiHeadAttn(nn.Module):
 
         return output
 
+
 class RelMultiHeadAttn(nn.Module):
     def __init__(self, n_head, d_model, d_head, dropout, dropatt=0,
                  tgt_len=None, ext_len=None, mem_len=None, pre_lnorm=False):
@@ -208,6 +209,7 @@ class RelMultiHeadAttn(nn.Module):
 
     def forward(self, w, r, attn_mask=None, mems=None):
         raise NotImplementedError
+
 
 class RelPartialLearnableMultiHeadAttn(RelMultiHeadAttn):
     def __init__(self, *args, **kwargs):
@@ -289,6 +291,7 @@ class RelPartialLearnableMultiHeadAttn(RelMultiHeadAttn):
             output = self.layer_norm(w + attn_out)
 
         return output
+
 
 class RelLearnableMultiHeadAttn(RelMultiHeadAttn):
     def __init__(self, *args, **kwargs):
@@ -375,6 +378,7 @@ class RelLearnableMultiHeadAttn(RelMultiHeadAttn):
 
         return output
 
+
 class DecoderLayer(nn.Module):
     def __init__(self, n_head, d_model, d_head, d_inner, dropout, **kwargs):
         super(DecoderLayer, self).__init__()
@@ -390,6 +394,7 @@ class DecoderLayer(nn.Module):
         output = self.pos_ff(output)
 
         return output
+
 
 class RelLearnableDecoderLayer(nn.Module):
     def __init__(self, n_head, d_model, d_head, d_inner, dropout,
@@ -409,6 +414,7 @@ class RelLearnableDecoderLayer(nn.Module):
         output = self.pos_ff(output)
 
         return output
+
 
 class RelPartialLearnableDecoderLayer(nn.Module):
     def __init__(self, n_head, d_model, d_head, d_inner, dropout,
@@ -450,7 +456,7 @@ class AdaptiveEmbedding(nn.Module):
         self.emb_projs = nn.ParameterList()
         if div_val == 1:
             self.emb_layers.append(
-                nn.Embedding(n_token, d_embed, sparse=sample_softmax>0)
+                nn.Embedding(n_token, d_embed, sparse=sample_softmax > 0)
             )
             if d_proj != d_embed:
                 self.emb_projs.append(nn.Parameter(torch.Tensor(d_proj, d_embed)))
@@ -492,7 +498,10 @@ class AdaptiveEmbedding(nn.Module):
 
         return embed
 
+
+# The Memory Transformer LM implementation
 class MemTransformerLM(nn.Module):
+
     def __init__(self, n_token, n_layer, n_head, d_model, d_head, d_inner,
                  dropout, dropatt, tie_weight=True, d_embed=None, 
                  div_val=1, tie_projs=[False], pre_lnorm=False,
@@ -509,8 +518,9 @@ class MemTransformerLM(nn.Module):
         self.n_head = n_head
         self.d_head = d_head
 
-        self.word_emb = AdaptiveEmbedding(n_token, d_embed, d_model, cutoffs, 
-                                          div_val=div_val)
+        # self.word_emb = AdaptiveEmbedding(n_token, d_embed, d_model, cutoffs,
+        #                                   div_val=div_val)
+        self.word_emb = nn.Embedding(n_token, d_embed)
 
         self.drop = nn.Dropout(dropout)
 
@@ -524,7 +534,7 @@ class MemTransformerLM(nn.Module):
         self.attn_type = attn_type
 
         self.layers = nn.ModuleList()
-        if attn_type == 0: # the default attention
+        if attn_type == 0:  # the default attention
             for i in range(n_layer):
                 self.layers.append(
                     RelPartialLearnableDecoderLayer(
@@ -532,7 +542,7 @@ class MemTransformerLM(nn.Module):
                         tgt_len=tgt_len, ext_len=ext_len, mem_len=mem_len,
                         dropatt=dropatt, pre_lnorm=pre_lnorm)
                 )
-        elif attn_type == 1: # learnable embeddings
+        elif attn_type == 1:  # learnable embeddings
             for i in range(n_layer):
                 self.layers.append(
                     RelLearnableDecoderLayer(
@@ -540,7 +550,7 @@ class MemTransformerLM(nn.Module):
                         tgt_len=tgt_len, ext_len=ext_len, mem_len=mem_len,
                         dropatt=dropatt, pre_lnorm=pre_lnorm)
                 )
-        elif attn_type in [2, 3]: # absolute embeddings
+        elif attn_type in [2, 3]:  # absolute embeddings
             for i in range(n_layer):
                 self.layers.append(
                     DecoderLayer(
@@ -550,31 +560,36 @@ class MemTransformerLM(nn.Module):
 
         self.sample_softmax = sample_softmax
         # use sampled softmax
-        if sample_softmax > 0:
-            self.out_layer = nn.Linear(d_model, n_token)
-            if tie_weight:
-                self.out_layer.weight = self.word_emb.weight
-            self.tie_weight = tie_weight
-            self.sampler = LogUniformSampler(n_token, sample_softmax)
-
-        # use adaptive softmax (including standard softmax)
-        else:
-            self.crit = ProjectedAdaptiveLogSoftmax(n_token, d_embed, d_model, 
-                                                    cutoffs, div_val=div_val)
-
-            if tie_weight:
-                for i in range(len(self.crit.out_layers)):
-                    self.crit.out_layers[i].weight = self.word_emb.emb_layers[i].weight
-
-            if tie_projs:
-                for i, tie_proj in enumerate(tie_projs):
-                    if tie_proj and div_val == 1 and d_model != d_embed:
-                        self.crit.out_projs[i] = self.word_emb.emb_projs[0]
-                    elif tie_proj and div_val != 1:
-                        self.crit.out_projs[i] = self.word_emb.emb_projs[i]
+        # if sample_softmax > 0:
+        #     self.out_layer = nn.Linear(d_model, n_token)
+        #     if tie_weight:
+        #         self.out_layer.weight = self.word_emb.weight
+        #     self.tie_weight = tie_weight
+        #     self.sampler = LogUniformSampler(n_token, sample_softmax)
+        #
+        # # use adaptive softmax (including standard softmax)
+        # else:
+        #     self.crit = ProjectedAdaptiveLogSoftmax(n_token, d_embed, d_model,
+        #                                             cutoffs, div_val=div_val)
+        #
+        #     if tie_weight:
+        #         for i in range(len(self.crit.out_layers)):
+        #             self.crit.out_layers[i].weight = self.word_emb.emb_layers[i].weight
+        #
+        #     if tie_projs:
+        #         for i, tie_proj in enumerate(tie_projs):
+        #             if tie_proj and div_val == 1 and d_model != d_embed:
+        #                 self.crit.out_projs[i] = self.word_emb.emb_projs[0]
+        #             elif tie_proj and div_val != 1:
+        #                 self.crit.out_projs[i] = self.word_emb.emb_projs[i]
+        self.out_layer = nn.Linear(d_model, n_token)
+        if tie_weight:
+            self.out_layer.weight = self.word_emb.weight
 
         self.same_length = same_length
         self.clamp_len = clamp_len
+
+        self.crit = torch.nn.CrossEntropyLoss(reduction='none')
 
         self._create_params()
 
@@ -734,7 +749,7 @@ class MemTransformerLM(nn.Module):
 
         return core_out, new_mems
 
-    def forward(self, data, target, *mems):
+    def forward(self, data, target, *mems, target_mask=None):
         # nn.DataParallel does not allow size(0) tensors to be broadcasted.
         # So, have to initialize size(0) mems inside the model forward.
         # Moreover, have to return new_mems to allow nn.DataParallel to piece
@@ -745,19 +760,26 @@ class MemTransformerLM(nn.Module):
         hidden, new_mems = self._forward(data, mems=mems)
 
         pred_hid = hidden[-tgt_len:]
-        if self.sample_softmax > 0 and self.training:
-            assert self.tie_weight
-            logit = sample_logits(self.word_emb,
-                self.out_layer.bias, target, pred_hid, self.sampler)
-            loss = -F.log_softmax(logit, -1)[:, :, 0]
-        else:
-            loss = self.crit(pred_hid.view(-1, pred_hid.size(-1)), target.view(-1))
-            loss = loss.view(tgt_len, -1)
+        # if self.sample_softmax > 0 and self.training:
+        #     assert self.tie_weight
+        #     logit = sample_logits(self.word_emb,
+        #         self.out_layer.bias, target, pred_hid, self.sampler)
+        #     loss = -F.log_softmax(logit, -1)[:, :, 0]
+        # else:
+        #     loss = self.crit(pred_hid.view(-1, pred_hid.size(-1)), target.view(-1))
+        #     loss = loss.view(tgt_len, -1)
+        # print(pred_hid.size())
+        logit = self.out_layer(pred_hid).float()
+
+        # print(logit.size())
+        # print(target.size())
+        loss = self.crit(logit.view(-1, logit.size(-1)), target.view(-1))
 
         if new_mems is None:
             return [loss]
         else:
             return [loss] + new_mems
+
 
 if __name__ == '__main__':
     import argparse
