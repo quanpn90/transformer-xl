@@ -7,8 +7,9 @@ import torch
 
 from utils.vocabulary import Vocab
 
+
 class LMOrderedIterator(object):
-    def __init__(self, data, bsz, bptt, device='cpu', ext_len=None):
+    def __init__(self, data, bsz, bptt, device='cpu', ext_len=None, bos_id=-1, eos_id=-1):
         """
             data -- LongTensor -- the LongTensor is strictly ordered
         """
@@ -24,8 +25,23 @@ class LMOrderedIterator(object):
         # Trim off any extra elements that wouldn't cleanly fit (remainders).
         data = data.narrow(0, 0, self.n_step * bsz)
 
+        weight = data.new(*data.size()).byte().fill_(1)
+        if bos_id > 0:
+            print("Creating target weights ...")
+            weight.fill_(0)
+            flag = False
+            for i in range(1, weight.size(0)):
+                if data[i-1].item() == bos_id:
+                    flag = True
+                elif data[i-1].item() == eos_id:
+                    flag = False
+                if flag:
+                    weight[i].fill_(1)
+            print("Done")
+
         # Evenly divide the data across the bsz batches.
         self.data = data.view(bsz, -1).t().contiguous().to(device)
+        self.weight = weight.view(bsz, -1).t().contiguous().to(device)
 
         # Number of mini-batches
         self.n_batch = (self.n_step + self.bptt - 1) // self.bptt
@@ -39,22 +55,24 @@ class LMOrderedIterator(object):
 
         data = self.data[beg_idx:end_idx]
         target = self.data[i+1:i+1+seq_len]
+        weight = self.weight[i+1:i+1+seq_len]
 
-        return data, target, seq_len
+        return data, target, seq_len, weight
 
     def get_fixlen_iter(self, start=0):
         for i in range(start, self.data.size(0) - 1, self.bptt):
             yield self.get_batch(i)
 
+    # Variable length iteration
     def get_varlen_iter(self, start=0, std=5, min_len=5, max_deviation=3):
         max_len = self.bptt + max_deviation * std
         i = start
         while True:
             bptt = self.bptt if np.random.random() < 0.95 else self.bptt / 2.
             bptt = min(max_len, max(min_len, int(np.random.normal(bptt, std))))
-            data, target, seq_len = self.get_batch(i, bptt)
+            data, target, seq_len, weight = self.get_batch(i, bptt)
             i += seq_len
-            yield data, target, seq_len
+            yield data, target, seq_len, weight
             if i >= self.data.size(0) - 2:
                 break
 

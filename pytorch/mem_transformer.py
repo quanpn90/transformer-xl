@@ -749,13 +749,13 @@ class MemTransformerLM(nn.Module):
 
         return core_out, new_mems
 
-    def forward(self, data, target, *mems, target_mask=None):
+    def forward(self, data, target, target_weight, *mems):
         # nn.DataParallel does not allow size(0) tensors to be broadcasted.
         # So, have to initialize size(0) mems inside the model forward.
         # Moreover, have to return new_mems to allow nn.DataParallel to piece
         # them together.
         if not mems: mems = self.init_mems()
-
+        # target_weight = None
         tgt_len = target.size(0)
         hidden, new_mems = self._forward(data, mems=mems)
 
@@ -769,11 +769,26 @@ class MemTransformerLM(nn.Module):
         #     loss = self.crit(pred_hid.view(-1, pred_hid.size(-1)), target.view(-1))
         #     loss = loss.view(tgt_len, -1)
         # print(pred_hid.size())
-        logit = self.out_layer(pred_hid).float()
+        # logit = self.out_layer(pred_hid).float()
 
         # print(logit.size())
         # print(target.size())
-        loss = self.crit(logit.view(-1, logit.size(-1)), target.view(-1))
+        pred_hid = pred_hid.view(-1, pred_hid.size(-1))
+        target = target.view(-1)
+        if target_weight is not None:
+            flattened_mask = target_weight.view(-1)
+            non_pad_indices = torch.nonzero(flattened_mask).squeeze(1)
+
+            clean_pred_hid = pred_hid.index_select(0, non_pad_indices)
+            clean_target = target.index_select(0, non_pad_indices)
+
+        else:
+            clean_pred_hid = pred_hid
+            clean_target = target
+
+        logit = self.out_layer(clean_pred_hid).float()
+
+        loss = self.crit.float()(logit, clean_target)
 
         if new_mems is None:
             return [loss]
