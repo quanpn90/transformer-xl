@@ -189,7 +189,7 @@ device = torch.device('cuda' if args.cuda else 'cpu')
 corpus = get_lm_corpus(args.data, args.dataset)
 ntokens = len(corpus.vocab)
 args.n_token = ntokens
-eval_batch_size = 10
+eval_batch_size = 1
 if 'bilingual' in args.dataset:
     bos_id = corpus.vocab.get_idx('<bos>')
     eos_id = corpus.vocab.get_idx('<eos>')
@@ -425,14 +425,14 @@ def evaluate(eval_iter):
     total_len, total_loss = 0, 0.
     with torch.no_grad():
         mems = tuple()
-        for i, (data, target, seq_len) in enumerate(eval_iter):
+        for i, (data, target, seq_len, weight) in enumerate(eval_iter):
             if 0 < args.max_eval_steps <= i:
                 break
-            ret = model(data, target, *mems)
+            ret = model(data, target, weight, *mems)
             loss, mems = ret[0], ret[1:]
-            loss = loss.mean()
-            total_loss += seq_len * loss.float().item()
-            total_len += seq_len
+            loss = loss.sum()
+            total_loss += loss.float().item()
+            total_len += weight.sum().item()
 
     # Switch back to the training mode
     model.reset_length(args.tgt_len, args.ext_len, args.mem_len)
@@ -443,7 +443,7 @@ def evaluate(eval_iter):
 
 def train():
     # Turn on training mode which enables dropout.
-    global train_step, train_loss, best_val_loss, eval_start_time, log_start_time
+    global train_step, best_val_loss, eval_start_time, log_start_time
     model.train()
     if args.batch_chunk > 1:
         mems = [tuple() for _ in range(args.batch_chunk)]
@@ -452,8 +452,9 @@ def train():
     train_iter = tr_iter.get_varlen_iter() if args.varlen else tr_iter
 
     n_accumulated_words = 0
-    temp_accumulated = 0
+    denom = 30000
     total_words = 0
+    train_loss = 0
 
     for batch, (data, target, seq_len, weight) in enumerate(train_iter):
         model.zero_grad()
@@ -475,14 +476,10 @@ def train():
             ret = para_model(data, target, weight, *mems)
             loss, mems = ret[0], ret[1:]
             ntarget = weight.sum().item()
-            denom = max(args.batch_size_update, ntarget)
-            temp_accumulated += denom
             loss = loss.float().sum().div(denom).type_as(loss)
-            # loss = loss.float().sum().type_as(loss)
 
             with amp.scale_loss(loss, optimizer) as scaled_loss:
                 scaled_loss.backward()
-            # train_loss += loss.float().item()
 
             train_loss += (loss.float().item() * denom)
             n_accumulated_words += ntarget
@@ -491,7 +488,7 @@ def train():
         if n_accumulated_words >= args.batch_size_update:
 
             # div gradients to the number of accumulated
-            scale_factor = n_accumulated_words / temp_accumulated
+            scale_factor = n_accumulated_words / denom
             scale_grad(amp.master_params(optimizer), scale_factor)
             torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.clip)
             n_accumulated_words = 0
@@ -530,7 +527,7 @@ def train():
                 else:
                     log_str += ' | ppl {:9.3f}'.format(math.exp(cur_loss))
                 logging(log_str)
-                train_loss = 0
+                # train_loss = 0
                 log_start_time = time.time()
 
             if train_step % args.eval_interval == 0:
@@ -574,6 +571,18 @@ best_val_loss = None
 
 log_start_time = time.time()
 eval_start_time = time.time()
+
+val_loss = evaluate(va_iter)
+logging('-' * 100)
+log_str = '| Eval at step {:>8d} | time: {:5.2f}s ' \
+          '| valid loss {:5.2f}'.format(
+    0,
+    (time.time() - eval_start_time), val_loss)
+if args.dataset in ['enwik8', 'text8']:
+    log_str += ' | bpc {:9.5f}'.format(val_loss / math.log(2))
+else:
+    log_str += ' | valid ppl {:9.3f}'.format(math.exp(val_loss))
+logging(log_str)
 
 # At any point you can hit Ctrl + C to break out of training early.
 try:

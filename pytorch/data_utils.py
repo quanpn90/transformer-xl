@@ -26,17 +26,33 @@ class LMOrderedIterator(object):
         data = data.narrow(0, 0, self.n_step * bsz)
 
         weight = data.new(*data.size()).byte().fill_(1)
+
+        # if bos_id > 0:
+        #     print("Creating target weights ...")
+        #     weight.fill_(0)
+        #     flag = False
+        #     for i in range(1, weight.size(0)):
+        #         if data[i-1].item() == bos_id:
+        #             flag = True
+        #         elif data[i-1].item() == eos_id:
+        #             flag = False
+        #         if flag:
+        #             weight[i].fill_(1)
+        #     print("Done")
         if bos_id > 0:
             print("Creating target weights ...")
             weight.fill_(0)
-            flag = False
-            for i in range(1, weight.size(0)):
-                if data[i-1].item() == bos_id:
-                    flag = True
-                elif data[i-1].item() == eos_id:
-                    flag = False
-                if flag:
-                    weight[i].fill_(1)
+
+            bos_ids = torch.nonzero(data.eq(bos_id)).squeeze().tolist()
+            eos_ids = torch.nonzero(data.eq(eos_id)).squeeze().tolist()
+
+            # the weights inside these boundaries have value 1 and 0s elsewhere
+            # still not optimized enough ...
+            for (bos_, eos_) in zip(bos_ids, eos_ids):
+                # print(bos_, eos_, eos_-bos_+1)
+                # input("Press any key to continue")
+                weight[bos_+1:eos_].fill_(1)
+
             print("Done")
 
         # Evenly divide the data across the bsz batches.
@@ -280,6 +296,7 @@ def get_lm_corpus(datadir, dataset):
         torch.save(corpus, fn)
 
     return corpus
+
 
 if __name__ == '__main__':
     import argparse
