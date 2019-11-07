@@ -77,3 +77,8 @@ def scale_grad(parameters, denominator):
     #         p.grad.data.mul_(clip_coef)
     # return total_norm
     return
+
+
+# best_beam_id = finalized[sent][0]['id']
+# for i in self.decoder_states:
+#     self.decoder_states[i]._retain_best_beam(best_beam_id)

@@ -9,15 +9,21 @@ import torch
 from data_utils import get_lm_corpus
 from mem_transformer import MemTransformerLM
 from utils.exp_utils import get_logger
+from inference.translator import Translator
+import copy
 
-parser = argparse.ArgumentParser(description='PyTorch Transformer Language Model')
+parser = argparse.ArgumentParser(description='Generate from Transformer XL')
 parser.add_argument('--data', type=str, default='../data/wikitext-103',
                     help='location of the data corpus')
+parser.add_argument('--input_file', type=str, default='./input.txt',
+                    help='location of the input source file to translate')
+parser.add_argument('--output_file', type=str, default='./output.txt',
+                    help='location of the output file for translation')
 parser.add_argument('--dataset', type=str, default='wt103',
                     choices=['wt103', 'lm1b', 'enwik8', 'text8', 'bilingual_ted'],
                     help='dataset name')
 parser.add_argument('--split', type=str, default='all',
-                    choices=['all', 'valid', 'test'],
+                    choices=['valid', 'test'],
                     help='which split to evaluate')
 parser.add_argument('--batch_size', type=int, default=1,
                     help='batch size')
@@ -58,6 +64,16 @@ parser.add_argument('--attn_type', type=int, default=0,
 parser.add_argument('--not_tied', action='store_true',
                     help='do not tie the word embedding and softmax weights')
 
+parser.add_argument('--beam_size', type=int, default=1,
+                    help='number of beams')
+parser.add_argument('--max_len', type=int, default=256,
+                    help='number of beams')
+
+def addone(f):
+    for line in f:
+        yield line
+    yield None
+
 args = parser.parse_args()
 args.tied = not args.not_tied
 if args.d_embed < 0:
@@ -92,8 +108,6 @@ te_iter = corpus.get_iterator('test', eval_batch_size, args.eval_tgt_len,
 
 
 # Load the best saved model.
-
-
 with open(os.path.join(args.work_dir, 'checkpoint.pt'), 'rb') as f:
     # model_state_dict = torch.load(f)
     checkpoint = torch.load(f)
@@ -109,6 +123,8 @@ with open(os.path.join(args.work_dir, 'checkpoint.pt'), 'rb') as f:
 model.backward_compatible()
 model = model.to(device)
 
+test_model = copy.deepcopy(model)
+
 logging('Evaluating with bsz {} tgt_len {} ext_len {} mem_len {} clamp_len {}'.format(
        args.batch_size, args.tgt_len, args.ext_len, args.mem_len, args.clamp_len))
 
@@ -118,56 +134,82 @@ if args.clamp_len > 0:
 if args.same_length:
     model.same_length = True
 
+
 ###############################################################################
 # Evaluation code
 ###############################################################################
-def evaluate(eval_iter):
-    # Turn on evaluation mode which disables dropout.
-    model.eval()
-    total_len, total_loss = 0, 0.
-    start_time = time.time()
-    with torch.no_grad():
-        mems = tuple()
-        for idx, (data, target, seq_len, weight) in enumerate(eval_iter):
-            ret = model(data, target, weight, *mems)
-            # print(weight)
-            loss, mems = ret[0], ret[1:]
-            loss = loss.sum()
-            total_loss += loss.float().item()
-            total_len += weight.sum().item()
-        total_time = time.time() - start_time
-    logging('Time : {:.2f}s, {:.2f}ms/segment'.format(
-            total_time, 1000 * total_time / (idx+1)))
-    return total_loss / total_len
 
+def translate(input_file, output_file):
+
+    inread = open(input_file)
+    outf = open(output_file, 'w')
+
+
+    mems = tuple()
+    counter = 0
+
+    bos_id = corpus.vocab.convert_to_tensor(["<bos>"]).item()
+    eos_id = corpus.vocab.convert_to_tensor(["<eos>"]).item()
+    vocab_size = ntokens
+
+    translator = Translator(model, args.beam_size, eos_id, bos_id, vocab_size, args.max_len)
+
+    for line in addone(inread):
+
+        if line is not None:
+            words = corpus.vocab.tokenize(line)  # + ["<bos>"]
+
+            # read in the source sentence
+            src = corpus.vocab.convert_to_tensor(words).unsqueeze(1).contiguous().to(device)
+
+            # translate using the beam searching model
+            pred_batch, pred_score, pred_length = translator.translate(src)
+            best_ids = pred_batch[0][0]
+            best_sent = []
+            # print(best_ids.size())
+            for i in range(best_ids.size(0)):
+
+                word = corpus.vocab.get_sym(best_ids[i].item())
+
+                if word not in ["<bos>", "<eos>"]:
+                    best_sent.append(word)
+
+            best_sent = " ".join(best_sent)
+            counter += 1
+
+            print("SOURCE %d : %s" % (counter, line.strip()))
+            # print(src.size())
+
+            # forward into greedy search model through the source
+            # with torch.no_grad():
+            #     ret = test_model(src, None, None, *mems)
+            #     hiddens, mems = ret[0], ret[1:]
+            #
+            # # take the last hidden state
+            # dec_inp = corpus.vocab.convert_to_tensor(["<bos>"]).unsqueeze(1).contiguous().to(device)
+            # new_sentence = []
+            # while True:
+            #     ret = test_model.greedy_step(dec_inp, *mems)
+            #
+            #     dec_inp, mems = ret[0], ret[1:]
+            #
+            #     dec_word = corpus.vocab.get_sym(dec_inp.squeeze().item())
+            #
+            #     if dec_word == "<eos>" or len(new_sentence) >= 100:
+            #         break
+            #     else:
+            #         # print(dec_word)
+            #         new_sentence += [dec_word]
+            #         continue
+            #
+            # output_sentence = " ".join(new_sentence)
+            # print("TRANSLATION GS %d: %s" % (counter, output_sentence))
+            print("TRANSLATION BS %d: %s" % (counter, best_sent))
+            output_sentence = best_sent
+            outf.write(output_sentence + "\n")
+            print("")
+
+    inread.close()
 
 # Run on test data.
-if args.split == 'all':
-    test_loss = evaluate(te_iter)
-    valid_loss = evaluate(va_iter)
-elif args.split == 'valid':
-    valid_loss = evaluate(va_iter)
-    test_loss = None
-elif args.split == 'test':
-    test_loss = evaluate(te_iter)
-    valid_loss = None
-
-
-def format_log(loss, split):
-    if args.dataset in ['enwik8', 'text8']:
-        log_str = '| {0} loss {1:5.2f} | {0} bpc {2:9.5f} '.format(
-            split, loss, loss / math.log(2))
-    else:
-        log_str = '| {0} loss {1:5.2f} | {0} ppl {2:9.3f} '.format(
-            split, loss, math.exp(loss))
-    return log_str
-
-log_str = ''
-if valid_loss is not None:
-    log_str += format_log(valid_loss, 'valid')
-if test_loss is not None:
-    log_str += format_log(test_loss, 'test')
-
-logging('=' * 100)
-logging(log_str)
-logging('=' * 100)
+translate(args.input_file, args.output_file)

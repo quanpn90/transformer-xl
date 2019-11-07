@@ -16,6 +16,7 @@ from mem_transformer import MemTransformerLM
 from utils.exp_utils import create_exp_dir, scale_grad
 from utils.data_parallel import BalancedDataParallel
 import apex.amp as amp
+import apex
 
 parser = argparse.ArgumentParser(description='PyTorch Transformer Language Model')
 parser.add_argument('--data', type=str, default='../data/wikitext-103',
@@ -35,8 +36,12 @@ parser.add_argument('--d_model', type=int, default=500,
                     help='model dimension')
 parser.add_argument('--d_inner', type=int, default=1000,
                     help='inner dimension in FF')
+parser.add_argument('--label_smoothing', type=float, default=0.0,
+                    help='label smoothing rate')
 parser.add_argument('--dropout', type=float, default=0.0,
                     help='global dropout rate')
+parser.add_argument('--word_dropout', type=float, default=0.0,
+                    help='dropping words at the embedding space')
 parser.add_argument('--dropatt', type=float, default=0.0,
                     help='attention probability dropout rate')
 parser.add_argument('--init', default='normal', type=str,
@@ -52,7 +57,7 @@ parser.add_argument('--init_std', type=float, default=0.02,
 parser.add_argument('--proj_init_std', type=float, default=0.01,
                     help='parameters initialized by N(0, init_std)')
 parser.add_argument('--optim', default='adam', type=str,
-                    choices=['adam', 'sgd', 'adagrad'],
+                    choices=['adam', 'sgd', 'adagrad', 'fused_adam'],
                     help='optimizer to use.')
 parser.add_argument('--lr', type=float, default=0.00025,
                     help='initial learning rate (0.00025|5 for adam|sgd)')
@@ -146,6 +151,7 @@ parser.add_argument('--static-loss-scale', type=float, default=1,
 parser.add_argument('--dynamic-loss-scale', action='store_true',
                     help='Use dynamic loss scaling.  If supplied, this argument'
                          ' supersedes --static-loss-scale.')
+
 args = parser.parse_args()
 args.tied = not args.not_tied
 
@@ -196,6 +202,8 @@ if 'bilingual' in args.dataset:
 else:
     bos_id = -1
     eos_id = -1
+args.bos_id = bos_id
+args.eos_id = eos_id
 
 tr_iter = corpus.get_iterator('train', args.batch_size, args.tgt_len,
                               device=device, ext_len=args.ext_len, bos_id=bos_id, eos_id=eos_id)
@@ -296,7 +304,8 @@ else:
                              tie_projs=tie_projs, pre_lnorm=args.pre_lnorm, tgt_len=args.tgt_len,
                              ext_len=args.ext_len, mem_len=args.mem_len, cutoffs=cutoffs,
                              same_length=args.same_length, attn_type=args.attn_type,
-                             clamp_len=args.clamp_len, sample_softmax=args.sample_softmax)
+                             clamp_len=args.clamp_len, sample_softmax=args.sample_softmax,
+                             word_dropout=args.word_dropout, label_smoothing=args.label_smoothing)
     model.apply(weights_init)
     model.word_emb.apply(weights_init)  # ensure embedding init is not overridden by out_layer in case of weight sharing
 args.n_all_param = sum([p.nelement() for p in model.parameters()])
@@ -341,6 +350,8 @@ elif args.optim.lower() == 'adam':
         optimizer = optim.Adam(dense_params, lr=args.lr)
     else:
         optimizer = optim.Adam(model.parameters(), lr=args.lr)
+elif args.optim.lower() == 'fused_adam':
+    optimizer = apex.optimizers.FusedAdam(model.parameters(), lr=args.lr)
 elif args.optim.lower() == 'adagrad':
     optimizer = optim.Adagrad(model.parameters(), lr=args.lr)
 
@@ -363,7 +374,7 @@ elif args.scheduler == 'inv_sqrt':
     def lr_lambda(step):
         # return a multiplier instead of a learning rate
         if step == 0 and args.warmup_step == 0:
-            return 1.
+            return 0.0
         else:
             return 1. / (step ** 0.5) if step > args.warmup_step \
                 else step / (args.warmup_step ** 1.5)
@@ -389,10 +400,17 @@ elif args.scheduler == 'constant':
 #                                dynamic_loss_args = {'init_scale': 2 ** 16})
 
 if args.restart:
-    if os.path.exists(os.path.join(args.restart_dir, 'optimizer.pt')):
-        with open(os.path.join(args.restart_dir, 'optimizer.pt'), 'rb') as f:
-            opt_state_dict = torch.load(f)
-            optimizer.load_state_dict(opt_state_dict)
+    # if os.path.exists(os.path.join(args.restart_dir, 'optimizer.pt')):
+    #     with open(os.path.join(args.restart_dir, 'optimizer.pt'), 'rb') as f:
+    #         opt_state_dict = torch.load(f)
+    #         optimizer.load_state_dict(opt_state_dict)
+    # else:
+    if os.path.exists(os.path.join(args.restart_dir, 'checkpoint.pt')):
+        with open(os.path.join(args.restart_dir, 'checkpoint.pt'), 'rb') as f:
+            checkpoint = torch.load(f)
+            optimizer.load_state_dict(checkpoint['optimizer'])
+            model.load_state_dict(checkpoint['model'])
+            amp.load_statedict(checkpoint['amp'])
     else:
         print('Optimizer was not saved. Start from scratch.')
 
@@ -429,9 +447,8 @@ def evaluate(eval_iter):
             if 0 < args.max_eval_steps <= i:
                 break
             ret = model(data, target, weight, *mems)
-            loss, mems = ret[0], ret[1:]
-            loss = loss.sum()
-            total_loss += loss.float().item()
+            loss, nll, mems =   ret[0], ret[1], ret[2:]
+            total_loss += nll
             total_len += weight.sum().item()
 
     # Switch back to the training mode
@@ -452,7 +469,7 @@ def train():
     train_iter = tr_iter.get_varlen_iter() if args.varlen else tr_iter
 
     n_accumulated_words = 0
-    denom = 30000
+    denom = 1024
     total_words = 0
     train_loss = 0
 
@@ -467,15 +484,15 @@ def train():
                 target_i = target_chunks[i].contiguous()
                 weight_i = weight_chunks[i].contiguous()
                 ret = para_model(data_i, target_i, *mems[i], weight_i)
-                loss, mems[i] = ret[0], ret[1:]
+                loss, nll, mems[i] = ret[0], ret[1], ret[2:]
                 loss = loss.float().mean().type_as(loss) / args.batch_chunk
                 with amp.scale_loss(loss, optimizer) as scaled_loss:
                     scaled_loss.backward()
                 train_loss += loss.float().item()
         else:
             ret = para_model(data, target, weight, *mems)
-            loss, mems = ret[0], ret[1:]
-            ntarget = weight.sum().item()
+            loss, nll, mems =  ret[0], ret[1], ret[2:]
+            ntarget = weight.float().sum().item()
             loss = loss.float().sum().div(denom).type_as(loss)
 
             with amp.scale_loss(loss, optimizer) as scaled_loss:
@@ -546,10 +563,16 @@ def train():
                 # Save the model if the validation loss is the best we've seen so far.
                 if not best_val_loss or val_loss < best_val_loss:
                     if not args.debug:
-                        with open(os.path.join(args.work_dir, 'model.pt'), 'wb') as f:
-                            torch.save(model.state_dict(), f)
-                        with open(os.path.join(args.work_dir, 'optimizer.pt'), 'wb') as f:
-                            torch.save(optimizer.state_dict(), f)
+                        checkpoint=dict()
+                        checkpoint['model'] = model.state_dict()
+                        checkpoint['optimizer'] = optimizer.state_dict()
+                        checkpoint['amp'] = amp.state_dict()
+                        checkpoint['args'] = args
+                        # checkpoint['vocab_size'] = args.n_token
+                        with open(os.path.join(args.work_dir, 'checkpoint.pt'), 'wb') as f:
+                            torch.save(checkpoint, f)
+                        # with open(os.path.join(args.work_dir, 'optimizer.pt'), 'wb') as f:
+                        #     torch.save(optimizer.state_dict(), f)
                     best_val_loss = val_loss
 
                 # dev-performance based learning rate annealing
@@ -595,19 +618,19 @@ try:
 except KeyboardInterrupt:
     logging('-' * 100)
     logging('Exiting from training early')
-
-# Load the best saved model.
-with open(os.path.join(args.work_dir, 'model.pt'), 'rb') as f:
-    model = torch.load(f)
-    para_model = model.to(device)
-
-# Run on test data.
-test_loss = evaluate(te_iter)
-logging('=' * 100)
-if args.dataset in ['enwik8', 'text8']:
-    logging('| End of training | test loss {:5.2f} | test bpc {:9.5f}'.format(
-        test_loss, test_loss / math.log(2)))
-else:
-    logging('| End of training | test loss {:5.2f} | test ppl {:9.3f}'.format(
-        test_loss, math.exp(test_loss)))
-logging('=' * 100)
+#
+# # Load the best saved model.
+# with open(os.path.join(args.work_dir, 'model.pt'), 'rb') as f:
+#     model = torch.load(f)
+#     para_model = model.to(device)
+#
+# # Run on test data.
+# test_loss = evaluate(te_iter)
+# logging('=' * 100)
+# if args.dataset in ['enwik8', 'text8']:
+#     logging('| End of training | test loss {:5.2f} | test bpc {:9.5f}'.format(
+#         test_loss, test_loss / math.log(2)))
+# else:
+#     logging('| End of training | test loss {:5.2f} | test ppl {:9.3f}'.format(
+#         test_loss, math.exp(test_loss)))
+# logging('=' * 100)

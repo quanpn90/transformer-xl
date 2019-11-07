@@ -34,7 +34,7 @@ class LMOrderedIterator(object):
         #     for i in range(1, weight.size(0)):
         #         if data[i-1].item() == bos_id:
         #             flag = True
-        #         elif data[i-1].item() == eos_id:
+        #         elif data[i-1].i`tem() == eos_id:
         #             flag = False
         #         if flag:
         #             weight[i].fill_(1)
@@ -49,9 +49,7 @@ class LMOrderedIterator(object):
             # the weights inside these boundaries have value 1 and 0s elsewhere
             # still not optimized enough ...
             for (bos_, eos_) in zip(bos_ids, eos_ids):
-                # print(bos_, eos_, eos_-bos_+1)
-                # input("Press any key to continue")
-                weight[bos_+1:eos_].fill_(1)
+                weight[bos_+1:eos_+1].fill_(1)
 
             print("Done")
 

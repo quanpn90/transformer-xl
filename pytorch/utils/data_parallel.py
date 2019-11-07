@@ -11,7 +11,7 @@ def scatter(inputs, target_gpus, chunk_sizes, dim=0):
     references to objects that are not tensors.
     """
     def scatter_map(obj):
-        if isinstance(obj, torch.Tensor):
+        if isinstance(obj, torch.Tensor):`
             try:
                 return Scatter.apply(target_gpus, chunk_sizes, dim, obj)
             except:

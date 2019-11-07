@@ -10,14 +10,18 @@ from data_utils import get_lm_corpus
 from mem_transformer import MemTransformerLM
 from utils.exp_utils import get_logger
 
-parser = argparse.ArgumentParser(description='PyTorch Transformer Language Model')
+parser = argparse.ArgumentParser(description='Generate from Transformer XL')
 parser.add_argument('--data', type=str, default='../data/wikitext-103',
                     help='location of the data corpus')
+parser.add_argument('--input_file', type=str, default='./input.txt',
+                    help='location of the input source file to translate')
+parser.add_argument('--output_file', type=str, default='./output.txt',
+                    help='location of the output file for translation')
 parser.add_argument('--dataset', type=str, default='wt103',
                     choices=['wt103', 'lm1b', 'enwik8', 'text8', 'bilingual_ted'],
                     help='dataset name')
 parser.add_argument('--split', type=str, default='all',
-                    choices=['all', 'valid', 'test'],
+                    choices=['valid', 'test'],
                     help='which split to evaluate')
 parser.add_argument('--batch_size', type=int, default=1,
                     help='batch size')
@@ -58,6 +62,11 @@ parser.add_argument('--attn_type', type=int, default=0,
 parser.add_argument('--not_tied', action='store_true',
                     help='do not tie the word embedding and softmax weights')
 
+def addone(f):
+    for line in f:
+        yield line
+    yield None
+
 args = parser.parse_args()
 args.tied = not args.not_tied
 if args.d_embed < 0:
@@ -92,8 +101,6 @@ te_iter = corpus.get_iterator('test', eval_batch_size, args.eval_tgt_len,
 
 
 # Load the best saved model.
-
-
 with open(os.path.join(args.work_dir, 'checkpoint.pt'), 'rb') as f:
     # model_state_dict = torch.load(f)
     checkpoint = torch.load(f)
@@ -118,56 +125,79 @@ if args.clamp_len > 0:
 if args.same_length:
     model.same_length = True
 
+
 ###############################################################################
 # Evaluation code
 ###############################################################################
-def evaluate(eval_iter):
-    # Turn on evaluation mode which disables dropout.
-    model.eval()
-    total_len, total_loss = 0, 0.
-    start_time = time.time()
-    with torch.no_grad():
-        mems = tuple()
-        for idx, (data, target, seq_len, weight) in enumerate(eval_iter):
-            ret = model(data, target, weight, *mems)
-            # print(weight)
-            loss, mems = ret[0], ret[1:]
-            loss = loss.sum()
-            total_loss += loss.float().item()
-            total_len += weight.sum().item()
-        total_time = time.time() - start_time
-    logging('Time : {:.2f}s, {:.2f}ms/segment'.format(
-            total_time, 1000 * total_time / (idx+1)))
-    return total_loss / total_len
+# def evaluate(eval_iter):
+#     # Turn on evaluation mode which disables dropout.
+#     model.eval()
+#     total_len, total_loss = 0, 0.
+#     start_time = time.time()
+#     with torch.no_grad():
+#         mems = tuple()
+#         for idx, (data, target, seq_len, weight) in enumerate(eval_iter):
+#             ret = model(data, target, weight, *mems)
+#             # print(weight)
+#             loss, mems = ret[0], ret[1:]
+#             loss = loss.sum()
+#             total_loss += loss.float().item()
+#             total_len += weight.sum().item()
+#         total_time = time.time() - start_time
+#     logging('Time : {:.2f}s, {:.2f}ms/segment'.format(
+#             total_time, 1000 * total_time / (idx+1)))
+#     return total_loss / total_len\
 
+def translate(input_file, output_file):
+
+    inread = open(input_file)
+    outf = open(output_file, 'w')
+    # with torch.no_grad():
+
+    mems = tuple()
+    counter = 0
+    for line in addone(inread):
+
+        if line is not None:
+            words = corpus.vocab.tokenize(line)  # + ["<bos>"]
+
+            # read in the source sentence
+            src = corpus.vocab.convert_to_tensor(words).unsqueeze(1).contiguous().to(device)
+            counter += 1
+
+            print("SOURCE %d : %s" % (counter, line.strip()))
+            print(src.size())
+
+            # forward into model through the source
+            with torch.no_grad():
+                ret = model(src, None, None, *mems)
+                hiddens, mems = ret[0], ret[1:]
+                for mem in mems:
+                    print(mem.size())
+
+            # take the last hidden state
+            dec_inp = corpus.vocab.convert_to_tensor(["<bos>"]).unsqueeze(1).contiguous().to(device)
+            new_sentence = []
+            while True:
+                ret = model.greedy_step(dec_inp, *mems)
+
+                dec_inp, mems = ret[0], ret[1:]
+
+                dec_word = corpus.vocab.get_sym(dec_inp.squeeze().item())
+
+                if dec_word == "<eos>" or len(new_sentence) >= 100:
+                    break
+                else:
+                    # print(dec_word)
+                    new_sentence += [dec_word]
+                    continue
+
+            output_sentence = " ".join(new_sentence)
+            print("TRANSLATION %d: %s" % (counter, output_sentence))
+            outf.write(output_sentence + "\n")
+            print("")
+
+    inread.close()
 
 # Run on test data.
-if args.split == 'all':
-    test_loss = evaluate(te_iter)
-    valid_loss = evaluate(va_iter)
-elif args.split == 'valid':
-    valid_loss = evaluate(va_iter)
-    test_loss = None
-elif args.split == 'test':
-    test_loss = evaluate(te_iter)
-    valid_loss = None
-
-
-def format_log(loss, split):
-    if args.dataset in ['enwik8', 'text8']:
-        log_str = '| {0} loss {1:5.2f} | {0} bpc {2:9.5f} '.format(
-            split, loss, loss / math.log(2))
-    else:
-        log_str = '| {0} loss {1:5.2f} | {0} ppl {2:9.3f} '.format(
-            split, loss, math.exp(loss))
-    return log_str
-
-log_str = ''
-if valid_loss is not None:
-    log_str += format_log(valid_loss, 'valid')
-if test_loss is not None:
-    log_str += format_log(test_loss, 'test')
-
-logging('=' * 100)
-logging(log_str)
-logging('=' * 100)
+translate(args.input_file, args.output_file)
