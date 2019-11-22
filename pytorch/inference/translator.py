@@ -3,6 +3,7 @@ import math
 from inference.search import BeamSearch, DiverseBeamSearch
 from collections import defaultdict
 
+
 class Translator(object):
     """
     Translation handling for the
@@ -19,7 +20,7 @@ class Translator(object):
         self.max_length = max_length
         self.normalize_scores = normalize
         self.len_penalty = alpha
-        self.no_repeat_ngram_size = 0
+        self.no_repeat_ngram_size = 8
         self.model = model
         self.beam_size = beam_size
         self.models = dict()
@@ -163,6 +164,7 @@ class Translator(object):
                         'attention': hypo_attn,  # src_len x tgt_len
                         'alignment': None,
                         'positional_scores': pos_scores[i],
+                        'id': i
                     }
 
                 if len(finalized[sent]) < beam_size:
@@ -183,7 +185,7 @@ class Translator(object):
         # - expanding the context over the batch dimension len_src x (B*beam) x H
         # - expanding the mask over the batch dimension    (B*beam) x len_src
 
-        # what do we do here form transformer XL?
+        # what do we do here for transformer XL?
         # the model would 'consume' the source sentence (don't refresh the memory)
 
         for i in range(self.n_models):
@@ -420,6 +422,17 @@ class Translator(object):
         # sort by score descending
         for sent in range(len(finalized)):
             finalized[sent] = sorted(finalized[sent], key=lambda r: r['score'], reverse=True)
+
+            states = self.decoder_states[0]
+            #
+            # for state in states.mems:
+            #     print(state.size())
+            # for i in self.decoder_states:
+
+            #
+            # best_beam_id = finalized[sent][0]['id']
+            # for i in self.decoder_states:
+            #     self.decoder_states[i]._retain_best_beam(best_beam_id)
 
         return finalized
 

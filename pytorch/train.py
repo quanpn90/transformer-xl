@@ -12,8 +12,8 @@ import torch.nn as nn
 import torch.optim as optim
 
 from data_utils import get_lm_corpus
-from mem_transformer import MemTransformerLM
-from utils.exp_utils import create_exp_dir, scale_grad
+from models.mem_transformer import MemTransformerLM
+from utils.exp_utils import create_exp_dir, scale_grad, checkpoint_paths
 from utils.data_parallel import BalancedDataParallel
 import apex.amp as amp
 import apex
@@ -116,8 +116,8 @@ parser.add_argument('--work_dir', default='LM-TFM', type=str,
                     help='experiment directory.')
 parser.add_argument('--restart', action='store_true',
                     help='restart training from the saved checkpoint')
-parser.add_argument('--restart_dir', type=str, default='',
-                    help='restart dir')
+parser.add_argument('--restart_checkpoint', type=str, default='',
+                    help='restart checkpoint')
 parser.add_argument('--debug', action='store_true',
                     help='run in debug mode (do not create exp dir)')
 parser.add_argument('--same_length', action='store_true',
@@ -161,10 +161,10 @@ if args.d_embed < 0:
 assert args.ext_len >= 0, 'extended context length must be non-negative'
 assert args.batch_size % args.batch_chunk == 0
 
-args.work_dir = '{}-{}'.format(args.work_dir, args.dataset)
-args.work_dir = os.path.join(args.work_dir, time.strftime('%Y%m%d-%H%M%S'))
+# args.work_dir = '{}-{}'.format(args.work_dir, args.dataset)
+# args.work_dir = os.path.join(args.work_dir, time.strftime('%Y%m%d-%H%M%S'))
 logging = create_exp_dir(args.work_dir,
-                         scripts_to_save=['train.py', 'mem_transformer.py'], debug=args.debug)
+                         scripts_to_save=['train.py'], debug=args.debug)
 
 # Set the random seed manually for reproducibility.
 np.random.seed(args.seed)
@@ -196,12 +196,8 @@ corpus = get_lm_corpus(args.data, args.dataset)
 ntokens = len(corpus.vocab)
 args.n_token = ntokens
 eval_batch_size = 1
-if 'bilingual' in args.dataset:
-    bos_id = corpus.vocab.get_idx('<bos>')
-    eos_id = corpus.vocab.get_idx('<eos>')
-else:
-    bos_id = -1
-    eos_id = -1
+bos_id = corpus.vocab.get_idx('<bos>')
+eos_id = corpus.vocab.get_idx('<eos>')
 args.bos_id = bos_id
 args.eos_id = eos_id
 
@@ -290,24 +286,17 @@ def update_dropatt(m):
         m.dropatt.p = args.dropatt
 
 
-if args.restart:
-    with open(os.path.join(args.restart_dir, 'model.pt'), 'rb') as f:
-        model = torch.load(f)
-    if not args.fp16:
-        model = model.float()
-    model.apply(update_dropout)
-    model.apply(update_dropatt)
-else:
-    model = MemTransformerLM(ntokens, args.n_layer, args.n_head, args.d_model,
-                             args.d_head, args.d_inner, args.dropout, args.dropatt,
-                             tie_weight=args.tied, d_embed=args.d_embed, div_val=args.div_val,
-                             tie_projs=tie_projs, pre_lnorm=args.pre_lnorm, tgt_len=args.tgt_len,
-                             ext_len=args.ext_len, mem_len=args.mem_len, cutoffs=cutoffs,
-                             same_length=args.same_length, attn_type=args.attn_type,
-                             clamp_len=args.clamp_len, sample_softmax=args.sample_softmax,
-                             word_dropout=args.word_dropout, label_smoothing=args.label_smoothing)
-    model.apply(weights_init)
-    model.word_emb.apply(weights_init)  # ensure embedding init is not overridden by out_layer in case of weight sharing
+
+model = MemTransformerLM(ntokens, args.n_layer, args.n_head, args.d_model,
+                         args.d_head, args.d_inner, args.dropout, args.dropatt,
+                         tie_weight=args.tied, d_embed=args.d_embed, div_val=args.div_val,
+                         tie_projs=tie_projs, pre_lnorm=args.pre_lnorm, tgt_len=args.tgt_len,
+                         ext_len=args.ext_len, mem_len=args.mem_len, cutoffs=cutoffs,
+                         same_length=args.same_length, attn_type=args.attn_type,
+                         clamp_len=args.clamp_len, sample_softmax=args.sample_softmax,
+                         word_dropout=args.word_dropout, label_smoothing=args.label_smoothing)
+model.apply(weights_init)
+model.word_emb.apply(weights_init)  # ensure embedding init is not overridden by out_layer in case of weight sharing
 args.n_all_param = sum([p.nelement() for p in model.parameters()])
 args.n_nonemb_param = sum([p.nelement() for p in model.layers.parameters()])
 
@@ -373,11 +362,13 @@ elif args.scheduler == 'inv_sqrt':
     # originally used for Transformer (in Attention is all you need)
     def lr_lambda(step):
         # return a multiplier instead of a learning rate
+        init_lr = 512 ** (-0.5) * args.lr
+
         if step == 0 and args.warmup_step == 0:
             return 0.0
         else:
-            return 1. / (step ** 0.5) if step > args.warmup_step \
-                else step / (args.warmup_step ** 1.5)
+            return init_lr * (step ** (-0.5)) if step > args.warmup_step \
+                else init_lr * step * (args.warmup_step ** (-1.5))
 
 
     scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
@@ -402,15 +393,17 @@ elif args.scheduler == 'constant':
 if args.restart:
     # if os.path.exists(os.path.join(args.restart_dir, 'optimizer.pt')):
     #     with open(os.path.join(args.restart_dir, 'optimizer.pt'), 'rb') as f:
-    #         opt_state_dict = torch.load(f)
+        #         opt_state_dict = torch.load(f)
     #         optimizer.load_state_dict(opt_state_dict)
     # else:
-    if os.path.exists(os.path.join(args.restart_dir, 'checkpoint.pt')):
-        with open(os.path.join(args.restart_dir, 'checkpoint.pt'), 'rb') as f:
+    # if os.path.exists(os.path.join(args.restart_dir, 'checkpoint.pt')):
+
+    if os.path.exists(args.restart_checkpoint):
+        with open(args.restart_checkpoint, 'rb') as f:
             checkpoint = torch.load(f)
             optimizer.load_state_dict(checkpoint['optimizer'])
             model.load_state_dict(checkpoint['model'])
-            amp.load_statedict(checkpoint['amp'])
+            amp.load_state_dict(checkpoint['amp'])
     else:
         print('Optimizer was not saved. Start from scratch.')
 
@@ -560,26 +553,35 @@ def train():
                     log_str += ' | valid ppl {:9.3f}'.format(math.exp(val_loss))
                 logging(log_str)
                 logging('-' * 100)
-                # Save the model if the validation loss is the best we've seen so far.
+                # Save the model (always)
+                checkpoint = dict()
+                checkpoint['model'] = model.state_dict()
+                checkpoint['optimizer'] = optimizer.state_dict()
+                checkpoint['amp'] = amp.state_dict()
+                checkpoint['args'] = args
+                checkpoint_name = 'checkpoint_ppl_%.6f_xl.pt' % val_loss
+                # checkpoint['vocab_size'] = args.n_token
+                checkpoint_dir = args.work_dir
+                with open(os.path.join(args.work_dir, checkpoint_name), 'wb') as f:
+                    log_str = "Saving to file %s" % os.path.join(args.work_dir, checkpoint_name)
+                    logging(log_str)
+                    torch.save(checkpoint, f)
+                existed_save_files = checkpoint_paths(checkpoint_dir)
+                num_save_files = 10
+                for save_file in existed_save_files[num_save_files:]:
+                    print(" * Deleting old save file %s ...." % save_file)
+                    os.remove(save_file)
+
+                # now we have to delete the worst checkpoint:
+
                 if not best_val_loss or val_loss < best_val_loss:
                     if not args.debug:
-                        checkpoint=dict()
-                        checkpoint['model'] = model.state_dict()
-                        checkpoint['optimizer'] = optimizer.state_dict()
-                        checkpoint['amp'] = amp.state_dict()
-                        checkpoint['args'] = args
-                        # checkpoint['vocab_size'] = args.n_token
-                        with open(os.path.join(args.work_dir, 'checkpoint.pt'), 'wb') as f:
-                            torch.save(checkpoint, f)
-                        # with open(os.path.join(args.work_dir, 'optimizer.pt'), 'wb') as f:
-                        #     torch.save(optimizer.state_dict(), f)
+                        continue
                     best_val_loss = val_loss
 
                 # dev-performance based learning rate annealing
                 if args.scheduler == 'dev_perf':
                     scheduler.step(val_loss)
-                    if args.sample_softmax > 0:
-                        scheduler_sparse.step(val_loss)
 
                 eval_start_time = time.time()
 

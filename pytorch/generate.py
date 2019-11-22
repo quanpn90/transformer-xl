@@ -7,7 +7,7 @@ import os, sys
 import torch
 
 from data_utils import get_lm_corpus
-from mem_transformer import MemTransformerLM
+from models.    mem_transformer import MemTransformerLM
 from utils.exp_utils import get_logger
 
 parser = argparse.ArgumentParser(description='Generate from Transformer XL')

@@ -907,7 +907,11 @@ class MemTransformerLM(nn.Module):
         if dec_state is None:
             mems = self.init_mems()
         else:
-            mems = dec_state.mems  # each memory size should be T x 1 x H
+            mems = dec_state.mems  # each memory size should be T x beam_size x H
+
+            # repeat the source
+            beam_size = mems[0].size(1)
+            src = src.repeat(1, beam_size)
 
         # forward pass through the source sentence
         ret = self.forward(src, None, None, *mems)
@@ -919,7 +923,8 @@ class MemTransformerLM(nn.Module):
         #     dec_state.update_mems(mems, beam_size=beam_size)
 
         # always return the decoder state
-        dec_state = DecoderState(mems, src.device, beam_size=beam_size)
+        clone = True if dec_state is None else False
+        dec_state = DecoderState(mems, src.device, beam_size=beam_size, clone=clone)
 
         return dec_state
 
@@ -931,18 +936,19 @@ class DecoderState(object):
     input_feeding and non-recurrent models.
     Modules need to implement this to utilize beam search decoding.
     """
-    def __init__(self, mems, device, beam_size=1):
+    def __init__(self, mems, device, beam_size=1, clone=False):
         self.mems = mems
         self.device = device
         self.beam_size = beam_size
 
         # only works with bsz 1 (at the moment, maybe)
-        bsz = 1
-        new_order = torch.arange(bsz).view(-1, 1).repeat(1, self.beam_size).view(-1)
-        new_order = new_order.to(device)
+        if clone:
+            bsz = 1
+            new_order = torch.arange(bsz).view(-1, 1).repeat(1, self.beam_size).view(-1)
+            new_order = new_order.to(device)
 
-        for i, mem in enumerate(self.mems):
-            self.mems[i] = mem.index_select(1, new_order)
+            for i, mem in enumerate(self.mems):
+                self.mems[i] = mem.index_select(1, new_order)
 
     def update_mems(self, mems, beam_size=1):
         self.mems = mems

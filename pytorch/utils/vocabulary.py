@@ -4,10 +4,10 @@ from collections import Counter, OrderedDict
 import torch
 
 class Vocab(object):
-    def __init__(self, special=[], min_freq=0, max_size=None, lower_case=True,
+    def __init__(self, special=[], min_freq=0, max_size=None, lower_case=False,
                  delimiter=None, vocab_file=None):
         self.counter = Counter()
-        self.special = special
+        self.special = special  #   + ["<pad>", "<unk>"]
         self.min_freq = min_freq
         self.max_size = max_size
         self.lower_case = lower_case
@@ -76,6 +76,7 @@ class Vocab(object):
         else:
             print('building vocab with min_freq={}, max_size={}'.format(
                 self.min_freq, self.max_size))
+
             self.idx2sym = []
             self.sym2idx = OrderedDict()
 
@@ -89,7 +90,7 @@ class Vocab(object):
             print('final vocab size {} from {} unique tokens'.format(
                 len(self), len(self.counter)))
 
-    def encode_file(self, path, ordered=False, verbose=False, add_eos=True,
+    def encode_file(self, path, ordered=False, verbose=False, add_eos=False,
             add_double_eos=False):
         if verbose: print('encoding file {} ...'.format(path))
         print(path)
@@ -108,16 +109,17 @@ class Vocab(object):
 
         return encoded
 
-    def encode_sents(self, sents, ordered=False, verbose=False):
+    def encode_sents(self, sents, verbose=False, bos=False, eos=False):
         if verbose: print('encoding {} sents ...'.format(len(sents)))
         encoded = []
         for idx, symbols in enumerate(sents):
             if verbose and idx > 0 and idx % 500000 == 0:
-                print('    line {}'.format(idx))
+                print('Encoded line {}'.format(idx))
+            # if bos:
+            #     symbols = ["<bos>"] + symbols
+            # if eos:
+            #     symbols = symbols + ["<eos>"]
             encoded.append(self.convert_to_tensor(symbols))
-
-        if ordered:
-            encoded = torch.cat(encoded)
 
         return encoded
 
@@ -140,8 +142,9 @@ class Vocab(object):
         if sym in self.sym2idx:
             return self.sym2idx[sym]
         else:
+            # return 0
             # print('encounter unk {}'.format(sym))
-            assert '<eos>' not in sym
+            assert '<unk>' not in sym
             assert hasattr(self, 'unk_idx')
             return self.sym2idx.get(sym, self.unk_idx)
 

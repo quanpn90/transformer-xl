@@ -7,7 +7,7 @@ import os, sys
 import torch
 
 from data_utils import get_lm_corpus
-from mem_transformer import MemTransformerLM
+from models.mem_transformer import MemTransformerLM
 from utils.exp_utils import get_logger
 from inference.translator import Translator
 import copy
@@ -41,30 +41,8 @@ parser.add_argument('--work_dir', type=str, required=True,
                     help='path to the work_dir')
 parser.add_argument('--no_log', action='store_true',
                     help='do not log the eval result')
-parser.add_argument('--same_length', action='store_true',
-                    help='set same length attention with masking')
-##MODEL CONFIG (for now)
-parser.add_argument('--n_layer', type=int, default=12,
-                    help='number of total layers')
-parser.add_argument('--n_head', type=int, default=10,
-                    help='number of heads')
-parser.add_argument('--d_head', type=int, default=50,
-                    help='head dimension')
-parser.add_argument('--d_embed', type=int, default=-1,
-                    help='embedding dimension')
-parser.add_argument('--d_model', type=int, default=500,
-                    help='model dimension')
-parser.add_argument('--d_inner', type=int, default=1000,
-                    help='inner dimension in FF')
-parser.add_argument('--pre_lnorm', action='store_true',
-                    help='apply LayerNorm to the input instead of the output')
-parser.add_argument('--attn_type', type=int, default=0,
-                    help='attention type. 0 for ours, 1 for Shaw et al,'
-                         '2 for Vaswani et al, 3 for Al Rfou et al.')
-parser.add_argument('--not_tied', action='store_true',
-                    help='do not tie the word embedding and softmax weights')
 
-parser.add_argument('--beam_size', type=int, default=1,
+parser.add_argument('--beam_size', type=int, default=4,
                     help='number of beams')
 parser.add_argument('--max_len', type=int, default=256,
                     help='number of beams')
@@ -74,10 +52,8 @@ def addone(f):
         yield line
     yield None
 
+
 args = parser.parse_args()
-args.tied = not args.not_tied
-if args.d_embed < 0:
-    args.d_embed = args.d_model
 
 assert args.ext_len >= 0, 'extended context length must be non-negative'
 
@@ -108,7 +84,7 @@ te_iter = corpus.get_iterator('test', eval_batch_size, args.eval_tgt_len,
 
 
 # Load the best saved model.
-with open(os.path.join(args.work_dir, 'checkpoint.pt'), 'rb') as f:
+with open(os.path.join(args.work_dir, 'model.average.pt'), 'rb') as f:
     # model_state_dict = torch.load(f)
     checkpoint = torch.load(f)
     model_args = checkpoint['args']
@@ -121,6 +97,7 @@ with open(os.path.join(args.work_dir, 'checkpoint.pt'), 'rb') as f:
                              clamp_len=model_args.clamp_len, sample_softmax=False)
     model.load_state_dict(checkpoint['model'])
 model.backward_compatible()
+model.eval()
 model = model.to(device)
 
 test_model = copy.deepcopy(model)
@@ -131,8 +108,6 @@ logging('Evaluating with bsz {} tgt_len {} ext_len {} mem_len {} clamp_len {}'.f
 model.reset_length(args.tgt_len, args.ext_len, args.mem_len)
 if args.clamp_len > 0:
     model.clamp_len = args.clamp_len
-if args.same_length:
-    model.same_length = True
 
 
 ###############################################################################
@@ -143,7 +118,6 @@ def translate(input_file, output_file):
 
     inread = open(input_file)
     outf = open(output_file, 'w')
-
 
     mems = tuple()
     counter = 0
@@ -204,7 +178,7 @@ def translate(input_file, output_file):
             #
             # output_sentence = " ".join(new_sentence)
             # print("TRANSLATION GS %d: %s" % (counter, output_sentence))
-            print("TRANSLATION BS %d: %s" % (counter, best_sent))
+            print("OUTPUT %d : %s" % (counter, best_sent))
             output_sentence = best_sent
             outf.write(output_sentence + "\n")
             print("")

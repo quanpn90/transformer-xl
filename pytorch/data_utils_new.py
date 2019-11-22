@@ -27,17 +27,24 @@ class LMOrderedIterator(object):
 
         weight = data.new(*data.size()).byte().fill_(1)
 
+        # if bos_id > 0:
+        #     print("Creating target weights ...")
+        #     weight.fill_(0)
+        #     flag = False
+        #     for i in range(1, weight.size(0)):
+        #         if data[i-1].item() == bos_id:
+        #             flag = True
+        #         elif data[i-1].i`tem() == eos_id:
+        #             flag = False
+        #         if flag:
+        #             weight[i].fill_(1)
+        #     print("Done")
         if bos_id > 0:
             print("Creating target weights ...")
             weight.fill_(0)
 
             bos_ids = torch.nonzero(data.eq(bos_id)).squeeze().tolist()
-
             eos_ids = torch.nonzero(data.eq(eos_id)).squeeze().tolist()
-            # print(bos_ids)
-            if len(bos_ids) != len(eos_ids):
-                print(len(eos_ids), len(bos_ids))
-            assert(len(bos_ids) == len(eos_ids))
 
             # the weights inside these boundaries have value 1 and 0s elsewhere
             # still not optimized enough ...
@@ -75,9 +82,7 @@ class LMOrderedIterator(object):
         max_len = self.bptt + max_deviation * std
         i = start
         while True:
-            # 95% of the time long bptt, 5% half
             bptt = self.bptt if np.random.random() < 0.95 else self.bptt / 2.
-
             bptt = min(max_len, max(min_len, int(np.random.normal(bptt, std))))
             data, target, seq_len, weight = self.get_batch(i, bptt)
             i += seq_len
@@ -96,10 +101,6 @@ class LMShuffledIterator(object):
         """
         self.data = data
 
-        # first: sort the data by size
-        sorted_data = sorted(data, key=lambda x: x.size(0))
-        self.data = sorted_data
-
         self.bsz = bsz
         self.bptt = bptt
         self.ext_len = ext_len if ext_len is not None else 0
@@ -107,177 +108,77 @@ class LMShuffledIterator(object):
         self.device = device
         self.shuffle = shuffle
 
-        self.batches = []
-        self.multiplier = 8
+    def get_sent_stream(self):
+        # index iterator
+        epoch_indices = np.random.permutation(len(self.data)) if self.shuffle \
+            else np.array(range(len(self.data)))
 
-        self.max_size = bsz * bptt  # maximum number of words in this minibatch
+        # sentence iterator
+        for idx in epoch_indices:
+            yield self.data[idx]
 
-        # allocate the sentences into groups
+    def stream_iterator(self, sent_stream):
+        # streams for each data in the batch
+        streams = [None] * self.bsz
 
-        def _oversized(_cur_length, _n_sentences, _cur_batch_sizes, bsz_length, bsz_tokens):
-            if n_sentences > bsz_length:
-                return True
+        data = torch.LongTensor(self.bptt, self.bsz)
+        target = torch.LongTensor(self.bptt, self.bsz)
 
-            if _n_sentences == 0:
-                return False
+        n_retain = 0
 
-            if (max(max(_cur_batch_sizes), max_size)) * (_n_sentences + 1) > bsz_tokens:
-                return True
+        while True:
+            # data   : [n_retain+bptt x bsz]
+            # target : [bptt x bsz]
+            data[n_retain:].fill_(-1)
+            target.fill_(-1)
 
-            return False
+            valid_batch = True
 
-        # batch allocation
-        cur_batch = []  # a list to store the sentence ids
-        cur_batch_sizes = []
-        i = 0
-        while i < len(self.data):
-            current_length = self.data[i].size(0)
+            for i in range(self.bsz):
+                n_filled = 0
+                try:
+                    while n_filled < self.bptt:
+                        # get next sentence
+                        if streams[i] is None or len(streams[i]) <= 1:
+                            streams[i] = next(sent_stream)
+                        # number of new tokens to fill in
+                        n_new = min(len(streams[i]) - 1, self.bptt - n_filled)
+                        # first n_retain tokens are retained from last batch
+                        data[n_retain+n_filled:n_retain+n_filled+n_new, i] = \
+                            streams[i][:n_new]
+                        target[n_filled:n_filled+n_new, i] = \
+                            streams[i][1:n_new+1]
+                        streams[i] = streams[i][n_new:]
+                        n_filled += n_new
+                except StopIteration:
+                    valid_batch = False
+                    break
 
-            oversized = _oversized(current_length, len(cur_batch), _cur_batch_sizes, self.max_size, self.bsz)
+            if not valid_batch:
+                return
 
-            if oversized:
-                # cut-off the current list to fit the multiplier
-                current_size = len(cur_batch)
-                scaled_size = max(
-                    self.multiplier * (current_size // self.multiplier),
-                    current_size % self.multiplier)
-                batch_ = cur_batch[:scaled_size]
-                self.batches.append(batch_)  # add this batch into the batch list
+            data = data.to(self.device)
+            target = target.to(self.device)
 
-                cur_batch = cur_batch[scaled_size:]  # reset the current batch
-                cur_batch_sizes = cur_batch_sizes[scaled_size:]
+            yield data, target, self.bptt
 
-            cur_batch.append(i)
-            cur_batch_sizes.append(current_length)
-
-            i = i + 1
-
-        # catch the last batch
-        if len(cur_batch) > 0:
-            self.batches.append(cur_batch)
-
-        self.num_batches = len(self.batches)
-
-    def collate(self, data):
-        """
-        :param data: list of sentences
-        :return: a tensor
-        """
-
-        lengths = [x.size(0) for x in data]
-        max_length = max(lengths)
-
-        # tensor size: T x B
-        tensor = data[0].new(max_length, len(data)).fill_(onmt.Constants.PAD)
-        weights = tensor.new(*tensor.size()).zero_()
-
-    # def get_sent_stream(self):
-    #     # index iterator
-    #     epoch_indices = np.random.permutation(len(self.data)) if self.shuffle \
-    #         else np.array(range(len(self.data)))
-    #
-    #     # sentence iterator
-    #     for idx in epoch_indices:
-    #         yield self.data[idx]
-    #
-    # def stream_iterator(self, sent_stream):
-    #     # streams for each data in the batch
-    #     streams = [None] * self.bsz
-    #
-    #     data = torch.LongTensor(self.bptt, self.bsz)
-    #     target = torch.LongTensor(self.bptt, self.bsz)
-    #
-    #     n_retain = 0
-    #
-    #     while True:
-    #         # data   : [n_retain+bptt x bsz]
-    #         # target : [bptt x bsz]
-    #         data[n_retain:].fill_(-1)
-    #         target.fill_(-1)
-    #
-    #         valid_batch = True
-    #
-    #         for i in range(self.bsz):
-    #             n_filled = 0
-    #             try:
-    #                 while n_filled < self.bptt:
-    #                     # get next sentence
-    #                     if streams[i] is None or len(streams[i]) <= 1:
-    #                         streams[i] = next(sent_stream)
-    #                     # number of new tokens to fill in
-    #                     n_new = min(len(streams[i]) - 1, self.bptt - n_filled)
-    #                     # first n_retain tokens are retained from last batch
-    #                     data[n_retain+n_filled:n_retain+n_filled+n_new, i] = \
-    #                         streams[i][:n_new]
-    #                     target[n_filled:n_filled+n_new, i] = \
-    #                         streams[i][1:n_new+1]
-    #                     streams[i] = streams[i][n_new:]
-    #                     n_filled += n_new
-    #             except StopIteration:
-    #                 valid_batch = False
-    #                 break
-    #
-    #         if not valid_batch:
-    #             return
-    #
-    #         data = data.to(self.device)
-    #         target = target.to(self.device)
-    #
-    #         yield data, target, self.bptt
-    #
-    #         n_retain = min(data.size(0), self.ext_len)
-    #         if n_retain > 0:
-    #             data[:n_retain] = data[-n_retain:]
-    #         data.resize_(n_retain + self.bptt, data.size(1))
+            n_retain = min(data.size(0), self.ext_len)
+            if n_retain > 0:
+                data[:n_retain] = data[-n_retain:]
+            data.resize_(n_retain + self.bptt, data.size(1))
 
     def __iter__(self):
         # sent_stream is an iterator
-        # sent_stream = self.get_sent_stream()
-
-        # how do we get next batch ...
+        sent_stream = self.get_sent_stream()
 
         for batch in self.stream_iterator(sent_stream):
             yield batch
 
 
-class LMMultiFileIterator(LMShuffledIterator):
-    def __init__(self, paths, vocab, bsz, bptt, device='cpu', ext_len=None,
-        shuffle=False):
-
-        self.paths = paths
-        self.vocab = vocab
-
-        self.bsz = bsz
-        self.bptt = bptt
-        self.ext_len = ext_len if ext_len is not None else 0
-
-        self.device = device
-        self.shuffle = shuffle
-
-    def get_sent_stream(self, path):
-        sents = self.vocab.encode_file(path, add_double_eos=True)
-        if self.shuffle:
-            np.random.shuffle(sents)
-        sent_stream = iter(sents)
-
-        return sent_stream
-
-    def __iter__(self):
-        if self.shuffle:
-            np.random.shuffle(self.paths)
-
-        for path in self.paths:
-            # sent_stream is an iterator
-            sent_stream = self.get_sent_stream(path)
-            for batch in self.stream_iterator(sent_stream):
-                yield batch
-
-
 class Corpus(object):
-    def __init__(self, path, dataset, order=True, *args, **kwargs):
+    # def __init__(self, path, dataset, order=True, *args, **kwargs):
+    def __init__(self, train_src, train_tgt, valid_src, valid_tgt, order=True, *args, **kwargs):
         self.dataset = dataset
-        self.vocab = Vocab(*args, **kwargs)
-        self.order = True
 
         # if self.dataset in ['ptb', 'wt2', 'enwik8', 'text8', 'bilingual_ted']:
         #     self.vocab.count_file(os.path.join(path, 'train.txt'))
@@ -292,15 +193,32 @@ class Corpus(object):
         #     train_paths = glob.glob(train_path_pattern)
         #     # the vocab will load from file when build_vocab() is called
 
-        self.vocab.count_file(os.path.join(path, 'train.txt'))
-        self.vocab.build_vocab()
+        if kwargs.get('share_vocab'):
+            self.src_vocab = Vocab(*args, **kwargs)
+            self.src_vocab.count_file(train_src)
+            self.src_vocab.count_file(train_tgt)
+            self.src_vocab.build_vocab()
+            self.tgt_vocab = self.src_vocab
+        else:
+            print("Two vocabularies are not supported at the moment")
+            raise NotImplementedError
 
-        self.train = self.vocab.encode_file(
-            os.path.join(path, 'train.txt'), ordered=order)
-        self.valid = self.vocab.encode_file(
-            os.path.join(path, 'valid.txt'), ordered=order)
-        self.test = self.vocab.encode_file(
-            os.path.join(path, 'test.txt'), ordered=order)
+        self.train = dict()
+
+        self.train['src'] = self.src_vocab.encode_file(train_src)
+
+        self.train['tgt'] = self.tgt_vocab.encode_file(train_tgt, bos=True, eos=True)
+
+        self.valid['src'] = self.src_vocab.encode_file(valid_src)
+
+        self.valid['tgt'] = self.tgt_vocab.encode_file(valid_tgt, bos=True, eos=True)
+
+        # self.train = self.vocab.encode_file(
+        #     os.path.join(path, 'train.txt'), ordered=order)
+        # self.valid = self.vocab.encode_file(
+        #     os.path.join(path, 'valid.txt'), ordered=order)
+        # self.test = self.vocab.encode_file(
+        #     os.path.join(path, 'test.txt'), ordered=order)
 
         # if self.dataset in ['ptb', 'wt2', 'wt103']:
         #
@@ -332,25 +250,15 @@ class Corpus(object):
         #         data_iter = LMOrderedIterator(data, *args, **kwargs)
         #     elif self.dataset == 'lm1b':
         #         data_iter = LMShuffledIterator(data, *args, **kwargs)
-
-        if not hasattr(self, 'order'):
-            self.order = True
-
-        if self.order:
-            if split == 'train':
-                data_iter = LMOrderedIterator(self.train, *args, **kwargs)
-            elif split in ['valid', 'test']:
-                data_iter = LMOrderedIterator(self.valid, *args, **kwargs)
-        else:
-            if split == 'train':
-                data_iter = LMShuffledIterator(self.train, *args, **kwargs)
-            elif split in ['valid', 'test']:
-                data_iter = LMShuffledIterator(self.valid, *args, **kwargs)
+        if split == 'train':
+            data_iter = LMOrderedIterator(self.train, *args, **kwargs)
+        elif split in ['valid', 'test']:
+            data_iter = LMOrderedIterator(self.valid, *args, **kwargs)
 
         return data_iter
 
 
-def get_lm_corpus(datadir, dataset, order=True):
+def get_translation_corpus(datadir, dataset, order=True, join_vocab=True):
     fn = os.path.join(datadir, 'cache.pt')
     if os.path.exists(fn):
         print('Loading cached dataset...')
@@ -358,8 +266,9 @@ def get_lm_corpus(datadir, dataset, order=True):
     else:
         print('Producing dataset {}...'.format(dataset))
         kwargs = {}
-        kwargs['special'] = ["<pad>", '<unk>', '<bos>', '<eos>']
+        kwargs['special'] = []
         kwargs['lower_case'] = False
+        kwargs['join_vocab'] = join_vocab
         # if dataset in ['wt103', 'wt2']:
         #     kwargs['special'] = ['<eos>']
         #     kwargs['lower_case'] = False
@@ -380,7 +289,6 @@ def get_lm_corpus(datadir, dataset, order=True):
         torch.save(corpus, fn)
 
     return corpus
-
 
 if __name__ == '__main__':
     import argparse

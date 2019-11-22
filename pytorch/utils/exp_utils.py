@@ -2,8 +2,10 @@ import functools
 import os, shutil
 
 import numpy as np
+import re
 
 import torch
+
 
 def logging(s, log_path, print_=True, log_=True):
     if print_:
@@ -12,8 +14,10 @@ def logging(s, log_path, print_=True, log_=True):
         with open(log_path, 'a+') as f_log:
             f_log.write(s + '\n')
 
+
 def get_logger(log_path, **kwargs):
     return functools.partial(logging, log_path=log_path, **kwargs)
+
 
 def create_exp_dir(dir_path, scripts_to_save=None, debug=False):
     if debug:
@@ -79,6 +83,31 @@ def scale_grad(parameters, denominator):
     return
 
 
-# best_beam_id = finalized[sent][0]['id']
-# for i in self.decoder_states:
-#     self.decoder_states[i]._retain_best_beam(best_beam_id)
+def checkpoint_paths(path, pattern=r'checkpoint_ppl_(\d+).(\d+)_xl.pt'):
+    """Retrieves all checkpoints found in `path` directory.
+    Checkpoints are identified by matching filename to the specified pattern. If
+    the pattern contains groups, the result will be sorted by the first group in
+    descending order.
+    """
+    pt_regexp = re.compile(pattern)
+
+    files = list()
+
+    for fname in os.listdir(path):
+        cur_path = os.path.join(path, fname)
+        if os.path.isdir(cur_path):
+            continue
+        elif "ppl" in fname:
+            files.append(fname)
+
+    # sort py perplexity (ascending)
+    files = sorted(files, key=lambda s: float(s.split("_")[2]))
+
+    entries = []
+    for i, f in enumerate(files):
+        m = pt_regexp.fullmatch(f)
+        if m is not None:
+            idx = int(m.group(1)) if len(m.groups()) > 0 else i
+            entries.append((idx, m.group(0)))
+    # return [os.path.join(path, x[1]) for x in sorted(entries, reverse=True)]
+    return [os.path.join(path, x[1]) for x in entries]
