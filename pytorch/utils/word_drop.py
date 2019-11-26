@@ -2,6 +2,7 @@ import torch
 import torch.nn.functional as F
 import torch.nn as nn
 
+
 class VariationalDropout(torch.nn.Module):
     def __init__(self, p=0.5, batch_first=False):
         super().__init__()
@@ -17,8 +18,8 @@ class VariationalDropout(torch.nn.Module):
         else:
             m = x.new(1, x.size(1), x.size(2)).bernoulli_(1 - self.p)
 
+        # scaling to ensure the expected value of the dropped units
         mask = m / (1 - self.p)
-        # mask = mask.expand_as(x)
 
         return mask * x
 

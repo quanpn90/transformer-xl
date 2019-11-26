@@ -229,10 +229,11 @@ class RelPartialLearnableMultiHeadAttn(RelMultiHeadAttn):
 
         # linear projection
         attn_out = self.o_net(attn_vec)
-        attn_out = self.drop(attn_out)
+        # attn_out = self.drop(attn_out)
 
         # Residual connection
-        output = w + attn_out
+        # output = w + attn_out
+        output = attn_out
 
         return output
 
@@ -311,13 +312,14 @@ class RelLearnableMultiHeadAttn(RelMultiHeadAttn):
 
         ##### linear projection
         attn_out = self.o_net(attn_vec)
-        attn_out = self.drop(attn_out)
+        # attn_out = self.drop(attn_out)
 
-        if self.pre_lnorm:
-            ##### residual connection
-            output = w + attn_out
-        else:
-            ##### residual connection + layer normalization
-            output = self.layer_norm(w + attn_out)
+        output = attn_out
+        # if self.pre_lnorm:
+        #     ##### residual connection
+        #     output = w + attn_out
+        # else:
+        #     ##### residual connection + layer normalization
+        #     output = self.layer_norm(w + attn_out)
 
         return output

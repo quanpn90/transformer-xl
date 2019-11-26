@@ -8,7 +8,21 @@ from torch.nn.modules.loss import _Loss
 sys.path.append('utils')
 sys.path.append('models')
 
+torch.set_printoptions(threshold=10000)
+
 from .decoders import DecoderLayer, RelLearnableDecoderLayer, RelPartialLearnableDecoderLayer
+
+
+def expected_length(length, death_rate):
+    e_length = 0
+
+    for l in range(length):
+        survival_rate = 1.0 - (l + 1) / length * death_rate
+
+        e_length += survival_rate
+
+    return e_length
+
 
 class LabelSmoothedCrossEntropy(_Loss):
 
@@ -67,7 +81,7 @@ class MemTransformerLM(nn.Module):
                  cutoffs=[], adapt_inp=False,
                  same_length=False, attn_type=0, clamp_len=-1,
                  sample_softmax=-1, word_dropout=0.0, label_smoothing=0.0,
-                 scale_emb=True):
+                 scale_emb=True, death_rate=0.0):
         super(MemTransformerLM, self).__init__()
         self.n_token = n_token
 
@@ -94,13 +108,30 @@ class MemTransformerLM(nn.Module):
 
         self.layers = nn.ModuleList()
 
-        for i in range(n_layer):
-            self.layers.append(
-                RelPartialLearnableDecoderLayer(
-                    n_head, d_model, d_head, d_inner, dropout,
-                    tgt_len=tgt_len, ext_len=ext_len, mem_len=mem_len,
-                    dropatt=dropatt)
-            )
+        if death_rate == 0:
+
+            for i in range(n_layer):
+                self.layers.append(
+                    RelPartialLearnableDecoderLayer(
+                        n_head, d_model, d_head, d_inner, dropout,
+                        tgt_len=tgt_len, ext_len=ext_len, mem_len=mem_len,
+                        dropatt=dropatt, death_rate=death_rate)
+                )
+        else:
+
+            e_length = expected_length(n_layer, death_rate)
+
+            print("Stochastic Transformer with %.2f expected layers" % e_length)
+
+            for l in range(n_layer):
+                # linearly decay the death rate
+                death_r = (l + 1.0) / n_layer * death_rate
+                self.layers.append(
+                    RelPartialLearnableDecoderLayer(
+                        n_head, d_model, d_head, d_inner, dropout,
+                        tgt_len=tgt_len, ext_len=ext_len, mem_len=mem_len,
+                        dropatt=dropatt, death_rate=death_r)
+                )
 
         self.sample_softmax = sample_softmax
         self.final_norm = nn.LayerNorm(self.d_model)
@@ -299,12 +330,14 @@ class MemTransformerLM(nn.Module):
 
     def step(self, data, decoder_state):
         # L x B
+        # print(data.size())
         if not decoder_state:
             # this shouldn't happen (conditional model)
             mems = self.init_mems()
         else:
             mems = decoder_state.mems
 
+        # take the final step of the sequence as current input (no re-calculation)
         input_ = data[:, -1].unsqueeze(1).t()
 
         # print(data.size())
@@ -327,7 +360,7 @@ class MemTransformerLM(nn.Module):
 
     def create_decoder_state(self, src, beam_size=1, dec_state=None):
 
-        if dec_state is None:
+        if dec_state is None or dec_state.mems is None:
             mems = self.init_mems()
         else:
             mems = dec_state.mems  # each memory size should be T x beam_size x H
@@ -383,6 +416,13 @@ class DecoderState(object):
     def _retain_best_beam(self, best_beam_id):
         for i, mem in enumerate(self.mems):
             self.mems[i] = mem[:, best_beam_id, :].unsqueeze(1)
+
+    def reset_memory(self):
+        # for i, mem in enumerate(self.mems):
+        #     self.mems[i] = None
+        self.mems = None
+        print("Coming")
+        return
 
 if __name__ == '__main__':
     import argparse

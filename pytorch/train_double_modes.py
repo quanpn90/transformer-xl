@@ -24,7 +24,6 @@ parser.add_argument('--data', type=str, default='../data/wikitext-103',
 parser.add_argument('--dataset', type=str, default='wt103',
                     choices=['wt103', 'lm1b', 'enwik8', 'text8', 'bilingual_ted'],
                     help='dataset name')
-parser.add_argument('--pretrain', type=str, default='')
 parser.add_argument('--no_order', action='store_true',
                     help='shuffle the data into typical batching')
 parser.add_argument('--n_layer', type=int, default=12,
@@ -47,8 +46,6 @@ parser.add_argument('--word_dropout', type=float, default=0.0,
                     help='dropping words at the embedding space')
 parser.add_argument('--dropatt', type=float, default=0.0,
                     help='attention probability dropout rate')
-parser.add_argument('--layer_drop', type=float, default=0.0,
-                    help='Dropping layer rate for stochastic layers')
 parser.add_argument('--init', default='normal', type=str,
                     help='parameter initializer to use.')
 parser.add_argument('--emb_init', default='normal', type=str,
@@ -89,6 +86,8 @@ parser.add_argument('--batch_size_update', type=int, default=1,
                     help='words per update')
 parser.add_argument('--batch_chunk', type=int, default=1,
                     help='split batch into chunks to save memory')
+parser.add_argument('--update_freq', type=int, default=1,
+                    help='minibatch per update')
 parser.add_argument('--tgt_len', type=int, default=70,
                     help='number of tokens to predict')
 parser.add_argument('--eval_tgt_len', type=int, default=50,
@@ -200,18 +199,19 @@ device = torch.device('cuda' if args.cuda else 'cpu')
 corpus = get_lm_corpus(args.data, args.dataset)
 ntokens = len(corpus.vocab)
 args.n_token = ntokens
-eval_batch_size = 1 if (not args.no_order) else args.batch_size
 eval_batch_size = 1
 bos_id = corpus.vocab.get_idx('<bos>')
 eos_id = corpus.vocab.get_idx('<eos>')
 args.bos_id = bos_id
 args.eos_id = eos_id
 
-tr_iter = corpus.get_iterator('train', args.batch_size, args.tgt_len, order=(not args.no_order),
+stream_tr_iter = corpus.get_iterator('train', args.batch_size, args.tgt_len, order=True,
                               device=device, ext_len=args.ext_len, bos_id=bos_id, eos_id=eos_id)
-va_iter = corpus.get_iterator('valid', eval_batch_size, args.eval_tgt_len, order=(not args.no_order),
+sent_tr_iter = corpus.get_iterator('train', args.batch_size, args.tgt_len * 4, order=False,
                               device=device, ext_len=args.ext_len, bos_id=bos_id, eos_id=eos_id)
-te_iter = corpus.get_iterator('test', eval_batch_size, args.eval_tgt_len, order=(not args.no_order),
+va_iter = corpus.get_iterator('valid', eval_batch_size, args.eval_tgt_len, order=True,
+                              device=device, ext_len=args.ext_len, bos_id=bos_id, eos_id=eos_id)
+te_iter = corpus.get_iterator('test', eval_batch_size, args.eval_tgt_len, order=True,
                               device=device, ext_len=args.ext_len, bos_id=bos_id, eos_id=eos_id)
 
 # adaptive softmax / embedding
@@ -291,8 +291,6 @@ def update_dropatt(m):
     if hasattr(m, 'dropatt'):
         m.dropatt.p = args.dropatt
 
-
-
 model = MemTransformerLM(ntokens, args.n_layer, args.n_head, args.d_model,
                          args.d_head, args.d_inner, args.dropout, args.dropatt,
                          tie_weight=args.tied, d_embed=args.d_embed, div_val=args.div_val,
@@ -300,8 +298,7 @@ model = MemTransformerLM(ntokens, args.n_layer, args.n_head, args.d_model,
                          ext_len=args.ext_len, mem_len=args.mem_len, cutoffs=cutoffs,
                          same_length=args.same_length, attn_type=args.attn_type,
                          clamp_len=args.clamp_len, sample_softmax=args.sample_softmax,
-                         word_dropout=args.word_dropout, label_smoothing=args.label_smoothing,
-                         death_rate=args.layer_drop)
+                         word_dropout=args.word_dropout, label_smoothing=args.label_smoothing)
 model.apply(weights_init)
 model.word_emb.apply(weights_init)  # ensure embedding init is not overridden by out_layer in case of weight sharing
 args.n_all_param = sum([p.nelement() for p in model.parameters()])
@@ -397,12 +394,6 @@ elif args.scheduler == 'constant':
 #                                dynamic_loss_scale = args.dynamic_loss_scale,
 #                                dynamic_loss_args = {'init_scale': 2 ** 16})
 
-if len(args.pretrain) > 0:
-    print("loading pretrained model from %s" % args.pretrain)
-    pretrained_checkpoint = torch.load(args.pretrain)
-    model.load_state_dict(pretrained_checkpoint['model'])
-    del pretrained_checkpoint
-
 if args.restart:
     # if os.path.exists(os.path.join(args.restart_dir, 'optimizer.pt')):
     #     with open(os.path.join(args.restart_dir, 'optimizer.pt'), 'rb') as f:
@@ -476,51 +467,71 @@ def train():
 
     mems = tuple()
 
-    tr_iter.reset_order()
-    train_iter = tr_iter.get_varlen_iter() if args.varlen else tr_iter
+    stream_tr_iter.reset_order()
+    train_iter = stream_tr_iter
 
     n_accumulated_words = 0
     denom = 1
+    seq_counter = 0
     total_words = 0
     train_loss = 0
+    update_now = False
 
     for batch, (data, target, seq_len, weight) in enumerate(train_iter):
         model.zero_grad()
-        if args.batch_chunk > 1:
-            data_chunks = torch.chunk(data, args.batch_chunk, 1)
-            target_chunks = torch.chunk(target, args.batch_chunk, 1)
-            weight_chunks = torch.chunk(weight, args.batch_chunk, 1)
-            for i in range(args.batch_chunk):
-                data_i = data_chunks[i].contiguous()
-                target_i = target_chunks[i].contiguous()
-                weight_i = weight_chunks[i].contiguous()
-                ret = para_model(data_i, target_i, *mems[i], weight_i)
-                loss, nll, mems[i] = ret[0], ret[1], ret[2:]
-                loss = loss.float().mean().type_as(loss) / args.batch_chunk
-                with amp.scale_loss(loss, optimizer) as scaled_loss:
-                    scaled_loss.backward()
-                train_loss += loss.float().item()
-        else:
-            ret = para_model(data, target, weight, *mems)
-            loss, nll, mems =  ret[0], ret[1], ret[2:]
-            ntarget = weight.float().sum().item()
-            loss = loss.float().sum().div(denom).type_as(loss)
 
+        # forward pass
+        ret = para_model(data, target, weight, *mems)
+
+        loss, nll, mems = ret[0], ret[1], ret[2:]
+
+        # total number of target words = sum of weights
+        ntarget = weight.float().sum().item()
+
+        # total loss
+        loss = loss.float().sum().type_as(loss)
+
+        # backward pass
+        with amp.scale_loss(loss, optimizer) as scaled_loss:
+            scaled_loss.backward()
+
+        train_loss += (loss.float().item() * denom)
+        n_accumulated_words += ntarget
+        total_words += ntarget
+        # # reset the memory if we don't care about order
+        # if args.no_order:
+        #     mems = tuple()
+
+        seq_counter = seq_counter + 1
+
+        # every 4 sequences
+        if seq_counter % args.update_freq == 0:
+
+            # sample one sentence level minibatch
+            data, target, seq_len, weight = sent_tr_iter.next()
+            # print(data.size())
+            # print(target.size())
+            no_mem = tuple()
+            _ret = para_model(data, target, weight, *no_mem)
+            loss, nll, _ = _ret[0], _ret[1], _ret[2:]
+            _ntarget = weight.float().sum().item()
+
+            loss = loss.float().sum().type_as(loss)
+            # backward pass
             with amp.scale_loss(loss, optimizer) as scaled_loss:
                 scaled_loss.backward()
 
+            n_accumulated_words += _ntarget
             train_loss += (loss.float().item() * denom)
-            n_accumulated_words += ntarget
-            total_words += ntarget
+            total_words += _ntarget
+            update_now = True
 
-        # reset the memory if we don't care about order
-        if args.no_order:
-            mems = tuple()
-
-        if n_accumulated_words >= args.batch_size_update:
+        # if n_accumulated_words >= args.batch_size_update:
+        if update_now:
 
             # div gradients to the number of accumulated
-            scale_factor = n_accumulated_words / denom
+            scale_factor = n_accumulated_words
+            # scale_factor = 1
             scale_grad(amp.master_params(optimizer), scale_factor)
             torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.clip)
             n_accumulated_words = 0
@@ -537,13 +548,11 @@ def train():
                 if train_step < args.warmup_step:
                     curr_lr = args.lr * train_step / args.warmup_step
                     optimizer.param_groups[0]['lr'] = curr_lr
-                    if args.sample_softmax > 0:
-                        optimizer_sparse.param_groups[0]['lr'] = curr_lr * 2
+
                 else:
                     if args.scheduler == 'cosine':
                         scheduler.step(train_step)
-                        if args.sample_softmax > 0:
-                            scheduler_sparse.step(train_step)
+
             elif args.scheduler == 'inv_sqrt':
                 scheduler.step(train_step)
 
@@ -609,6 +618,8 @@ def train():
 
             if train_step == args.max_step:
                 break
+            update_now = False
+
 
 
 # Loop over epochs.

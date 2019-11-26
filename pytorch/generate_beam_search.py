@@ -15,6 +15,8 @@ import copy
 parser = argparse.ArgumentParser(description='Generate from Transformer XL')
 parser.add_argument('--data', type=str, default='../data/wikitext-103',
                     help='location of the data corpus')
+parser.add_argument('--model', type=str, required=True,
+                    help='path to the model')
 parser.add_argument('--input_file', type=str, default='./input.txt',
                     help='location of the input source file to translate')
 parser.add_argument('--output_file', type=str, default='./output.txt',
@@ -41,7 +43,10 @@ parser.add_argument('--work_dir', type=str, required=True,
                     help='path to the work_dir')
 parser.add_argument('--no_log', action='store_true',
                     help='do not log the eval result')
-
+parser.add_argument('--no_context', action='store_true',
+                    help='do not use the previous sentence context')
+parser.add_argument('--debug', action='store_true',
+                    help='debugging sentences')
 parser.add_argument('--beam_size', type=int, default=4,
                     help='number of beams')
 parser.add_argument('--max_len', type=int, default=256,
@@ -77,14 +82,15 @@ eval_batch_size = args.batch_size
 args.eval_tgt_len = args.tgt_len
 # tr_iter = corpus.get_iterator('train', args.batch_size, args.tgt_len,
 #                               device=device, ext_len=args.ext_len, bos_id=bos_id, eos_id=eos_id)
-va_iter = corpus.get_iterator('valid', eval_batch_size, args.eval_tgt_len,
-                              device=device, ext_len=args.ext_len, bos_id=bos_id, eos_id=eos_id)
-te_iter = corpus.get_iterator('test', eval_batch_size, args.eval_tgt_len,
-                              device=device, ext_len=args.ext_len, bos_id=bos_id, eos_id=eos_id)
+# va_iter = corpus.get_iterator('valid', eval_batch_size, args.eval_tgt_len,
+#                               device=device, ext_len=args.ext_len, bos_id=bos_id, eos_id=eos_id)
+# te_iter = corpus.get_iterator('test', eval_batch_size, args.eval_tgt_len,
+#                               device=device, ext_len=args.ext_len, bos_id=bos_id, eos_id=eos_id)
 
 
 # Load the best saved model.
-with open(os.path.join(args.work_dir, 'model.average.pt'), 'rb') as f:
+# with open(os.path.join(args.work_dir, 'model.average.pt'), 'rb') as f:
+with open(args.model, 'rb') as f:
     # model_state_dict = torch.load(f)
     checkpoint = torch.load(f)
     model_args = checkpoint['args']
@@ -126,7 +132,7 @@ def translate(input_file, output_file):
     eos_id = corpus.vocab.convert_to_tensor(["<eos>"]).item()
     vocab_size = ntokens
 
-    translator = Translator(model, args.beam_size, eos_id, bos_id, vocab_size, args.max_len)
+    translator = Translator(model, args.beam_size, eos_id, bos_id, vocab_size, args.max_len, no_context=args.no_context)
 
     for line in addone(inread):
 
@@ -152,36 +158,13 @@ def translate(input_file, output_file):
             counter += 1
 
             print("SOURCE %d : %s" % (counter, line.strip()))
-            # print(src.size())
-
-            # forward into greedy search model through the source
-            # with torch.no_grad():
-            #     ret = test_model(src, None, None, *mems)
-            #     hiddens, mems = ret[0], ret[1:]
-            #
-            # # take the last hidden state
-            # dec_inp = corpus.vocab.convert_to_tensor(["<bos>"]).unsqueeze(1).contiguous().to(device)
-            # new_sentence = []
-            # while True:
-            #     ret = test_model.greedy_step(dec_inp, *mems)
-            #
-            #     dec_inp, mems = ret[0], ret[1:]
-            #
-            #     dec_word = corpus.vocab.get_sym(dec_inp.squeeze().item())
-            #
-            #     if dec_word == "<eos>" or len(new_sentence) >= 100:
-            #         break
-            #     else:
-            #         # print(dec_word)
-            #         new_sentence += [dec_word]
-            #         continue
-            #
-            # output_sentence = " ".join(new_sentence)
-            # print("TRANSLATION GS %d: %s" % (counter, output_sentence))
             print("OUTPUT %d : %s" % (counter, best_sent))
             output_sentence = best_sent
             outf.write(output_sentence + "\n")
             print("")
+
+            if args.debug:
+                exit()
 
     inread.close()
 

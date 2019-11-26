@@ -9,29 +9,33 @@ class Translator(object):
     Translation handling for the
     """
     def __init__(self, model, beam_size, eos_id, bos_id, vocab_size, max_length,
-                 normalize=False, alpha=0.0, verbose=True):
+                 normalize=False, alpha=0.0, verbose=True, no_context=False, pad_id=-1):
 
         self.search = BeamSearch(vocab_size)
         self.eos = eos_id
-        self.pad = -1  # currently we don't have padding
+        self.pad = pad_id  # currently we don't have padding
         self.bos = bos_id
+        self.eos = eos_id
         self.vocab_size = vocab_size
         self.min_len = 1
         self.max_length = max_length
         self.normalize_scores = normalize
         self.len_penalty = alpha
-        self.no_repeat_ngram_size = 8
+        self.no_repeat_ngram_size = 0
         self.model = model
         self.beam_size = beam_size
         self.models = dict()
         self.models[0] = self.model
         self.n_models = 1
+        self.no_context = no_context
+        print(self.no_context)
 
         self.pad = -1000
         
         if verbose:
             print('* Current bos id: %d' % self.bos)
-            print('* Using beam search')
+            print('* Current eos id: %d' % self.eos)
+            # print('* Using beam search')
 
         self.decoder_states = defaultdict(lambda: None)
 
@@ -63,10 +67,6 @@ class Translator(object):
         src_tokens = src.transpose(0, 1)  # batch x time
         src_lengths = (src_tokens.ne(self.eos) & src_tokens.ne(self.pad)).long().sum(dim=1)
         blacklist = src_tokens.new_zeros(bsz, beam_size).eq(-1)  # forward and backward-compatible False mask
-
-        # memories retained from the previous sentence
-        # maintained in a list for an ensemble of models?
-        prefix_memories = []
 
         # list of completed sentences
         finalized = [[] for i in range(bsz)]
@@ -194,7 +194,10 @@ class Translator(object):
         # Start decoding
         for step in range(max_len + 1):  # one extra step for EOS marker
             # reorder decoder internal states based on the prev choice of beams
+            # print("Step number %d" % step)
+            # print(reorder_state)
             if reorder_state is not None:
+
                 if batch_idxs is not None:
                     # update beam indices to take into account removed sentences
                     corr = batch_idxs - torch.arange(batch_idxs.numel()).type_as(batch_idxs)
@@ -206,7 +209,8 @@ class Translator(object):
             lprobs, avg_attn_scores = self._decode(decode_input, self.decoder_states)
             avg_attn_scores = None
 
-            lprobs[:, self.pad] = -math.inf  # never select pad
+            if self.pad >= 0:
+                lprobs[:, self.pad] = -math.inf  # never select pad
 
             # handle min and max length constraints
             if step >= max_len:
@@ -280,11 +284,15 @@ class Translator(object):
                 for bbsz_idx in range(bsz * beam_size):
                     lprobs[bbsz_idx, banned_tokens[bbsz_idx]] = -math.inf
 
+            # return the top 2k scores and indices
+            # choose the first k which don't predict eos to continue
             cand_scores, cand_indices, cand_beams = self.search.step(
                 step,
                 lprobs.view(bsz, -1, self.vocab_size),
                 scores.view(bsz, beam_size, -1)[:, :, :step],
             )
+            # print(cand_scores.size(), cand_scores)
+            # print(cand_indices, cand_beams)
 
             # cand_bbsz_idx contains beam indices for the top candidate
             # hypotheses, with a range of values: [0, bsz*beam_size),
@@ -309,6 +317,9 @@ class Translator(object):
                     mask=eos_mask[:, :beam_size],
                     out=eos_scores,
                 )
+                # print("")
+                # print("Finalizing ", cand_indices,   cand_bbsz_idx, eos_bbsz_idx)
+                # print("")
                 finalized_sents = finalize_hypos(step, eos_bbsz_idx, eos_scores)
                 num_remaining_sent -= len(finalized_sents)
 
@@ -317,11 +328,13 @@ class Translator(object):
                 break
             assert step < max_len
 
+            # ruling out the finished sentences from the mini batch (all of the beams finished for a sentence)
             if len(finalized_sents) > 0:
+
                 new_bsz = bsz - len(finalized_sents)
 
                 # construct batch_idxs which holds indices of batches to keep for the next pass
-                batch_mask = cand_indices.new_ones(bsz)
+                batch_mask = cand_indices.new_ones(bsz)  # bsz of 1s
                 batch_mask[cand_indices.new(finalized_sents)] = 0
                 batch_idxs = batch_mask.nonzero().squeeze(-1)
 
@@ -424,6 +437,9 @@ class Translator(object):
             finalized[sent] = sorted(finalized[sent], key=lambda r: r['score'], reverse=True)
 
             states = self.decoder_states[0]
+
+        if self.no_context:
+            self.decoder_states = defaultdict(lambda: None)
             #
             # for state in states.mems:
             #     print(state.size())
